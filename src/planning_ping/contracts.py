@@ -11,28 +11,39 @@ from typing import Callable, Generic, Literal, Protocol, TypeVar, runtime_checka
 
 ApplicationSortField = Literal[
     "reference",
-    "description",
+    "council",
+    "application_date",
     "received_date",
     "validated_date",
+    "description",
     "address",
-    "local_authority",
+    "postcode",
     "status",
 ]
 SortDirection = Literal["asc", "desc"]
-Region = Literal["England", "Wales", "Scotland"]
-SearchEventKind = Literal["started", "progress", "warning", "error", "completed", "cancelled"]
-IssueSeverity = Literal["warning", "error"]
+SearchEventKind = Literal[
+    "started",
+    "council_started",
+    "council_finished",
+    "application_saved",
+    "warning",
+    "completed",
+    "cancelled",
+]
+SearchStatus = Literal["completed", "cancelled", "completed_with_issues"]
 
 T = TypeVar("T")
 
 APPLICATION_SORT_FIELDS: frozenset[str] = frozenset(
     {
         "reference",
+        "council",
+        "application_date",
         "description",
         "received_date",
         "validated_date",
         "address",
-        "local_authority",
+        "postcode",
         "status",
     }
 )
@@ -72,13 +83,15 @@ class SearchRequest:
 class ApplicationFilters:
     """The supported filters, page, and ordering for application results."""
 
-    query: str = ""
-    local_authority: str | None = None
-    status: str | None = None
-    region: Region | None = None
+    reference: str = ""
+    address: str = ""
+    postcode: str = ""
+    application_date: date | None = None
+    keywords: str = ""
+    council: str = ""
     page: int = 1
     page_size: int = 50
-    sort_by: ApplicationSortField = "received_date"
+    sort_by: ApplicationSortField = "application_date"
     sort_direction: SortDirection = "desc"
 
     def __post_init__(self) -> None:
@@ -101,51 +114,59 @@ class SearchEvent:
     """A progress, warning, or completion update emitted during a search."""
 
     kind: SearchEventKind
-    message: str
-    current: int | None = None
-    total: int | None = None
-    run_id: str | None = None
+    run_id: int | None = None
+    council: str | None = None
+    completed: int = 0
+    total: int = 0
+    saved_count: int = 0
+    message: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class SearchSummary:
     """The final outcome of a completed or cancelled search run."""
 
-    run_id: str
+    run_id: int
+    status: SearchStatus
+    total_councils: int
+    searched_councils: int
+    saved_applications: int
+    empty_councils: int
+    failed_councils: int
     started_at: datetime
     finished_at: datetime
-    applications_found: int
-    applications_saved: int
-    issues_created: int
-    cancelled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class ApplicationRow:
     """An application returned by the applications query service."""
 
-    application_id: str
+    application_id: int
     reference: str
-    description: str
-    address: str
-    local_authority: str
-    region: Region
+    council: str
+    application_date: date | None
     received_date: date | None
     validated_date: date | None
+    description: str
+    address: str
+    postcode: str
     status: str | None
-    source_url: str
+    application_url: str
+    council_url: str
 
 
 @dataclass(frozen=True, slots=True)
 class IssueRow:
     """A bounded-completeness issue recorded during a search run."""
 
-    issue_id: str
-    run_id: str | None
-    severity: IssueSeverity
+    issue_id: int
+    run_id: int | None
+    timestamp: datetime
+    council: str
+    portal_family: str
+    outcome: str
+    error_type: str | None
     message: str
-    created_at: datetime
-    application_reference: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,7 +204,7 @@ class ApplicationQueryService(Protocol):
 class IssueQueryService(Protocol):
     """Provides issues recorded by a particular search run or all runs."""
 
-    def list_issues(self, run_id: str | None = None) -> tuple[IssueRow, ...]:
+    def list_issues(self, run_id: int | None = None) -> tuple[IssueRow, ...]:
         """Return recorded issues, optionally scoped to one run."""
 
 
