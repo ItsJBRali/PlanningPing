@@ -124,7 +124,6 @@ class SearchEvent:
     total: int = 0
     saved_count: int = 0
     message: str | None = None
-
     def __post_init__(self) -> None:
         if self.kind not in SEARCH_EVENT_KINDS:
             raise ValueError(f"kind must be one of {sorted(SEARCH_EVENT_KINDS)}")
@@ -143,7 +142,6 @@ class SearchSummary:
     failed_councils: int
     started_at: datetime
     finished_at: datetime
-
     def __post_init__(self) -> None:
         if self.status not in SEARCH_STATUSES:
             raise ValueError(f"status must be one of {sorted(SEARCH_STATUSES)}")
