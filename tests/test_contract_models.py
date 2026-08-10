@@ -71,6 +71,54 @@ class ContractModelsTests(unittest.TestCase):
         self.assertEqual(12, summary.saved_applications)
         self.assertEqual(1, summary.failed_councils)
 
+    def test_accepts_every_event_kind_and_summary_status(self) -> None:
+        event_kinds = (
+            "started",
+            "council_started",
+            "council_finished",
+            "application_saved",
+            "warning",
+            "completed",
+            "cancelled",
+        )
+        for kind in event_kinds:
+            with self.subTest(kind=kind):
+                self.assertEqual(kind, contracts.SearchEvent(kind=kind).kind)
+
+        now = datetime(2026, 1, 31, 9, 0, tzinfo=timezone.utc)
+        for status in ("completed", "cancelled", "completed_with_issues"):
+            with self.subTest(status=status):
+                summary = contracts.SearchSummary(
+                    run_id=1,
+                    status=status,
+                    total_councils=0,
+                    searched_councils=0,
+                    saved_applications=0,
+                    empty_councils=0,
+                    failed_councils=0,
+                    started_at=now,
+                    finished_at=now,
+                )
+                self.assertEqual(status, summary.status)
+
+    def test_rejects_unknown_event_kind_and_summary_status_at_runtime(self) -> None:
+        with self.assertRaisesRegex(ValueError, "kind"):
+            contracts.SearchEvent(kind="progress")
+
+        now = datetime(2026, 1, 31, 9, 0, tzinfo=timezone.utc)
+        with self.assertRaisesRegex(ValueError, "status"):
+            contracts.SearchSummary(
+                run_id=1,
+                status="error",
+                total_councils=0,
+                searched_councils=0,
+                saved_applications=0,
+                empty_councils=0,
+                failed_councils=0,
+                started_at=now,
+                finished_at=now,
+            )
+
     def test_issue_rows_identify_council_outcome_and_error(self) -> None:
         timestamp = datetime(2026, 1, 31, 9, 1, tzinfo=timezone.utc)
         issue = contracts.IssueRow(

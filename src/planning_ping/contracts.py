@@ -48,6 +48,10 @@ APPLICATION_SORT_FIELDS: frozenset[str] = frozenset(
     }
 )
 SORT_DIRECTIONS: frozenset[str] = frozenset({"asc", "desc"})
+SEARCH_EVENT_KINDS: frozenset[str] = frozenset(
+    {"started", "council_started", "council_finished", "application_saved", "warning", "completed", "cancelled"}
+)
+SEARCH_STATUSES: frozenset[str] = frozenset({"completed", "cancelled", "completed_with_issues"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +125,10 @@ class SearchEvent:
     saved_count: int = 0
     message: str | None = None
 
+    def __post_init__(self) -> None:
+        if self.kind not in SEARCH_EVENT_KINDS:
+            raise ValueError(f"kind must be one of {sorted(SEARCH_EVENT_KINDS)}")
+
 
 @dataclass(frozen=True, slots=True)
 class SearchSummary:
@@ -135,6 +143,10 @@ class SearchSummary:
     failed_councils: int
     started_at: datetime
     finished_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.status not in SEARCH_STATUSES:
+            raise ValueError(f"status must be one of {sorted(SEARCH_STATUSES)}")
 
 
 @dataclass(frozen=True, slots=True)

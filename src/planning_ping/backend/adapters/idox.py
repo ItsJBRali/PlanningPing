@@ -1,0 +1,597 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from datetime import date, timedelta
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
+
+from lxml import html
+
+from planning_ping.backend.adapters.base import PlanningScraper
+from planning_ping.backend.http import (
+    CouncilBrowserClient,
+    CouncilFetchError,
+    CouncilHttpClient,
+    FetchResponse,
+    browser_fallback_recommended,
+)
+from planning_ping.backend.adapter_models import DiscoveryResult, PlanningApplication, PlanningDocument
+from planning_ping.backend.parsing import clean_text, extract_postcode, normalize_label, parse_council_date
+
+
+IDOX_REFERENCE_RE = re.compile(
+    r"\b(?:"
+    r"[A-Z]{1,8}\d{2,4}/[A-Z0-9.-]+(?:/[A-Z0-9.-]+)*"
+    r"|[A-Z]{1,8}/\d{2,4}/[A-Z0-9.-]+(?:/[A-Z0-9.-]+)*"
+    r"|\d{2,4}/[A-Z0-9.-]+(?:/[A-Z0-9.-]+)*"
+    r")\b",
+    flags=re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class IdoxCouncilConfig:
+    authority: str
+    base_url: str
+    application_root: str = "/online-applications/"
+
+
+class IdoxPublicAccessScraper(PlanningScraper):
+    """Scraper for councils using Idox PublicAccess planning portals."""
+
+    MAX_PAGED_RESULT_PAGES = 100
+
+    _label_map = {
+        "reference": "reference", "caseno": "reference", "case_no": "reference",
+        "application_reference": "reference", "planning_reference": "reference", "application_number": "reference",
+        "address": "address", "site_address": "address", "location": "address",
+        "proposal": "description", "description": "description", "development_description": "description",
+        "status": "status", "application_status": "status", "decision": "decision",
+        "date_received": "date_received", "received": "date_received", "application_received": "date_received",
+        "valid_date": "date_validated", "date_valid": "date_validated", "date_validated": "date_validated",
+        "validated": "date_validated", "application_validated": "date_validated",
+        "applicant_name": "applicant_name", "applicant": "applicant_name",
+        "agent_name": "agent_name", "agent": "agent_name",
+        "case_officer": "case_officer", "officer": "case_officer", "ward": "ward", "parish": "parish",
+    }
+
+    def __init__(self, config: IdoxCouncilConfig, *, http_client: CouncilHttpClient | None = None) -> None:
+        super().__init__(config.authority)
+        self.config = config
+        self.http = http_client or CouncilHttpClient(
+            timeout_seconds=30.0,
+            min_delay_seconds=2.0,
+            retries=6,
+            concurrency_key="portal:idox",
+        )
+
+    def discover_ids(self, *, listing_url: str | None = None, start_date: date | None = None, end_date: date | None = None, limit: int | None = None) -> DiscoveryResult:
+        try:
+            return self._discover_ids(listing_url=listing_url, start_date=start_date, end_date=end_date, limit=limit)
+        except CouncilFetchError as exc:
+            if not browser_fallback_recommended(exc) or isinstance(self.http, CouncilBrowserClient):
+                raise
+            primary_error = exc
+            browser = CouncilBrowserClient()
+            self.http = browser
+            try:
+                return self._discover_ids(listing_url=listing_url, start_date=start_date, end_date=end_date, limit=limit)
+            except Exception as browser_error:
+                browser.close()
+                browser_error.add_note(f"Direct portal request also failed: {primary_error}")
+                raise
+
+    def _discover_ids(self, *, listing_url: str | None = None, start_date: date | None = None, end_date: date | None = None, limit: int | None = None) -> DiscoveryResult:
+        if listing_url and (start_date or end_date):
+            try:
+                response = self._fetch_advanced_search(listing_url, start_date=start_date, end_date=end_date)
+            except CouncilFetchError:
+                if not self._is_complete_week_range(start_date, end_date):
+                    raise
+                return self._discover_weekly_range(start_date, end_date, limit=limit)
+        elif listing_url:
+            response = self.http.get(listing_url)
+        else:
+            return self._discover_weekly_range(start_date, end_date, limit=limit)
+        applications = self._parse_listing_pages(response, limit=limit)
+        if (
+            not applications
+            and listing_url
+            and self._is_complete_week_range(start_date, end_date)
+        ):
+            return self._discover_weekly_range(start_date, end_date, limit=limit)
+        if limit is not None:
+            applications = applications[:limit]
+        return DiscoveryResult(authority=self.authority, source_url=response.url, applications=applications)
+
+    def fetch_application(self, uid: str, url: str | None = None, *, include_documents: bool = False) -> PlanningApplication:
+        response = self.http.get(url or self.build_detail_url(uid))
+        application = self.parse_detail(response.text, response.url, fallback_uid=uid)
+        if include_documents:
+            application.documents = self.fetch_documents(uid)
+        return application
+
+    def build_weekly_list_url(self, *, start_date: date | None = None, end_date: date | None = None) -> str:
+        params = {"action": "weeklyList"}
+        if start_date:
+            params["dateStart"] = start_date.strftime("%d/%m/%Y")
+        if end_date:
+            params["dateEnd"] = end_date.strftime("%d/%m/%Y")
+        return f"{self._portal_url('search.do')}?{urlencode(params)}"
+
+    def build_detail_url(self, uid: str) -> str:
+        return f"{self._portal_url('applicationDetails.do')}?{urlencode({'activeTab': 'summary', 'keyVal': uid})}"
+
+    def build_documents_url(self, uid: str) -> str:
+        return f"{self._portal_url('applicationDetails.do')}?{urlencode({'activeTab': 'documents', 'keyVal': uid})}"
+
+    def fetch_documents(self, uid: str, url: str | None = None) -> list[PlanningDocument]:
+        response = self.http.get(url or self.build_documents_url(uid))
+        return self.parse_documents(response.text, response.url)
+
+    def parse_listing(self, html_text: str, page_url: str) -> list[PlanningApplication]:
+        document = html.fromstring(html_text)
+        seen: set[str] = set()
+        applications: list[PlanningApplication] = []
+        for anchor in document.xpath("//a[contains(@href, 'applicationDetails.do')]"):
+            href = anchor.get("href")
+            uid = self._extract_uid(href)
+            if not uid or uid in seen:
+                continue
+            seen.add(uid)
+            row_text = self._nearest_row_text(anchor)
+            reference = self._extract_reference(anchor, row_text)
+            result_item = self._result_item(anchor)
+            description = self._listing_description(anchor, result_item, reference)
+            address = self._class_text(result_item, "address") or self._extract_address(row_text, reference)
+            status = self._status_text(result_item)
+            date_received = self._listing_date(result_item, "Received")
+            date_validated = self._listing_date(result_item, "Validated")
+            detail_complete = bool(description and address and (date_received or date_validated))
+            applications.append(PlanningApplication(
+                authority=self.authority, uid=uid, url=self._summary_url(page_url, uid),
+                reference=reference, address=address, description=description, status=status,
+                date_received=date_received, date_validated=date_validated,
+                postcode=extract_postcode(address), source_url=page_url,
+                raw={"listing_text": row_text, "detail_complete": detail_complete} if row_text else {},
+            ))
+        if len(applications) == 1 and self._looks_like_application_summary(document):
+            detail = self.parse_detail(html_text, page_url, fallback_uid=applications[0].uid)
+            detail.url = applications[0].url
+            detail.source_url = page_url
+            return [detail]
+        return applications
+
+    def _parse_listing_pages(self, response: FetchResponse, *, limit: int | None = None) -> list[PlanningApplication]:
+        applications: list[PlanningApplication] = []
+        seen_uids: set[str] = set()
+        seen_urls: set[str] = {response.url}
+        queued_urls = self._paged_result_urls(response.text, response.url)
+        processed_pages = 1
+
+        def add_page(html_text: str, page_url: str) -> None:
+            for application in self.parse_listing(html_text, page_url):
+                if application.uid in seen_uids:
+                    continue
+                seen_uids.add(application.uid)
+                applications.append(application)
+
+        add_page(response.text, response.url)
+        while queued_urls and (limit is None or len(applications) < limit):
+            if processed_pages >= self.MAX_PAGED_RESULT_PAGES:
+                break
+            page_url = queued_urls.pop(0)
+            if page_url in seen_urls:
+                continue
+            seen_urls.add(page_url)
+            page = self.http.get(page_url)
+            processed_pages += 1
+            add_page(page.text, page.url)
+            for discovered_url in self._paged_result_urls(page.text, page.url):
+                if discovered_url not in seen_urls and discovered_url not in queued_urls:
+                    queued_urls.append(discovered_url)
+            queued_urls.sort(key=self._paged_result_sort_key)
+        return applications
+
+    def _paged_result_urls(self, html_text: str, page_url: str) -> list[str]:
+        document = html.fromstring(html_text)
+        urls: list[str] = []
+        for anchor in document.xpath("//a[@href]"):
+            href = anchor.get("href") or ""
+            parsed = urlsplit(href)
+            query = parse_qs(parsed.query)
+            if query.get("action", [""])[0] != "page":
+                continue
+            if not (query.get("searchCriteria.page") or query.get("page")):
+                continue
+            absolute_url = urljoin(page_url, href)
+            if absolute_url not in urls:
+                urls.append(absolute_url)
+        return sorted(urls, key=self._paged_result_sort_key)
+
+    def _paged_result_sort_key(self, url: str) -> int:
+        query = parse_qs(urlsplit(url).query)
+        for key in ("searchCriteria.page", "page"):
+            values = query.get(key)
+            if values and values[0].isdigit():
+                return int(values[0])
+        return 0
+
+    def parse_detail(self, html_text: str, page_url: str, *, fallback_uid: str | None = None) -> PlanningApplication:
+        fields = self._extract_labelled_fields(html.fromstring(html_text))
+        raw: dict[str, str] = {}
+        mapped: dict[str, str] = {}
+        for label, value in fields.items():
+            raw[label] = value
+            model_field = self._label_map.get(normalize_label(label))
+            if model_field and value:
+                mapped[model_field] = value
+        for field in ("date_received", "date_validated"):
+            if mapped.get(field):
+                mapped[field] = parse_council_date(mapped[field]) or mapped[field]
+        uid = self._extract_uid(page_url) or self._raw_value(raw, "casetechnicalkey", "case_technical_key") or fallback_uid or mapped.get("reference")
+        if not uid:
+            raise ValueError("Could not determine Idox application uid")
+        address = mapped.get("address")
+        return PlanningApplication(
+            authority=self.authority, uid=uid, url=page_url, reference=mapped.get("reference"),
+            address=address, description=mapped.get("description"), status=mapped.get("status"),
+            decision=mapped.get("decision"), date_received=mapped.get("date_received"),
+            date_validated=mapped.get("date_validated"), applicant_name=mapped.get("applicant_name"),
+            agent_name=mapped.get("agent_name"), case_officer=mapped.get("case_officer"),
+            ward=mapped.get("ward"), parish=mapped.get("parish"), postcode=extract_postcode(address, raw.get("postcode")),
+            source_url=self.config.base_url, raw=raw,
+        )
+
+    def parse_documents(self, html_text: str, page_url: str) -> list[PlanningDocument]:
+        document = html.fromstring(html_text)
+        documents: list[PlanningDocument] = []
+        seen: set[str] = set()
+        for anchor in document.xpath("//a[@href]"):
+            href = anchor.get("href")
+            if not self._is_document_href(href):
+                continue
+            absolute_url = urljoin(page_url, href)
+            if absolute_url in seen:
+                continue
+            seen.add(absolute_url)
+            row_text = self._nearest_row_text(anchor)
+            row = anchor.xpath("ancestor::tr[1]")
+            cells = [clean_text(" ".join(cell.itertext())) for cell in row[0].xpath("./th|./td")] if row else []
+            cells = [cell for cell in cells if cell]
+            title = clean_text(" ".join(anchor.itertext())) or self._document_title_from_url(absolute_url)
+            metadata = self._document_metadata(cells, row_text, title)
+            documents.append(PlanningDocument(
+                title=title, url=absolute_url, document_type=metadata.get("document_type"),
+                date_published=parse_council_date(metadata.get("date_published")),
+                file_size=metadata.get("file_size"), description=metadata.get("description"),
+                source_url=page_url,
+            ))
+        return documents
+
+    def _fetch_weekly_list(self, *, start_date: date | None = None, end_date: date | None = None):
+        response = self.http.get(self.build_weekly_list_url(start_date=start_date, end_date=end_date))
+        document = html.fromstring(response.text)
+        forms = document.xpath("//form[contains(@action, 'weeklyListResults.do')]")
+        if not forms:
+            return response
+        form = forms[0]
+        data = self._form_defaults(form)
+        data.setdefault("searchType", "Application")
+        data.setdefault("dateType", "DC_Validated")
+        if start_date:
+            data["week"] = self._weekly_option_value(form, start_date)
+        return self.http.post_form(urljoin(response.url, form.get("action")), data)
+
+    def _discover_weekly_range(
+        self,
+        start_date: date | None,
+        end_date: date | None,
+        *,
+        limit: int | None,
+    ) -> DiscoveryResult:
+        week_starts = self._weekly_start_dates(start_date, end_date)
+        applications: list[PlanningApplication] = []
+        seen: set[str] = set()
+        source_url = self.build_weekly_list_url(start_date=start_date, end_date=end_date)
+
+        for week_start in week_starts:
+            week_end = week_start + timedelta(days=6) if week_start else end_date
+            response = self._fetch_weekly_list(start_date=week_start, end_date=week_end)
+            source_url = response.url
+            remaining = None if limit is None else max(limit - len(applications), 0)
+            if remaining == 0:
+                break
+            for application in self._parse_listing_pages(response, limit=remaining):
+                if limit is not None and len(applications) >= limit:
+                    break
+                if application.uid in seen:
+                    continue
+                seen.add(application.uid)
+                application.raw = {
+                    **(application.raw or {}),
+                    "date_range_filtered": True,
+                    "portal_week": week_start.isoformat() if week_start else "current",
+                }
+                applications.append(application)
+            if limit is not None and len(applications) >= limit:
+                break
+        return DiscoveryResult(authority=self.authority, source_url=source_url, applications=applications)
+
+    def _weekly_start_dates(
+        self,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> list[date | None]:
+        if start_date is None:
+            return [None]
+        final_date = end_date or start_date
+        week_start = start_date - timedelta(days=start_date.weekday())
+        weeks: list[date | None] = []
+        while week_start <= final_date:
+            weeks.append(week_start)
+            week_start += timedelta(days=7)
+        return weeks
+
+    def _weekly_option_value(self, form: html.HtmlElement, week_start: date) -> str:
+        expected = week_start.strftime("%d %b %Y")
+        for option in form.xpath(".//select[@name='week']/option"):
+            value = option.get("value")
+            label = clean_text(" ".join(option.itertext()))
+            if expected.casefold() in {(value or "").casefold(), (label or "").casefold()}:
+                return value if value is not None else expected
+        return expected
+
+    @staticmethod
+    def _is_complete_week_range(start_date: date | None, end_date: date | None) -> bool:
+        if start_date is None or end_date is None or end_date < start_date:
+            return False
+        return (
+            start_date.weekday() == 0
+            and end_date.weekday() == 6
+            and ((end_date - start_date).days + 1) % 7 == 0
+        )
+
+    def _fetch_advanced_search(self, listing_url: str, *, start_date: date | None = None, end_date: date | None = None):
+        response = self.http.get(listing_url)
+        document = html.fromstring(response.text)
+        forms = document.xpath("//form[contains(@action, 'advancedSearchResults.do') or contains(@action, 'searchResults.do')]")
+        if not forms:
+            params = self._advanced_search_dates(start_date=start_date, end_date=end_date)
+            return self.http.get(urljoin(response.url, "advancedSearchResults.do?action=firstPage"), params)
+        form = forms[0]
+        data = self._form_defaults(form)
+        data.update(self._advanced_search_dates(start_date=start_date, end_date=end_date, form_data=data))
+        data.setdefault("searchType", "Application")
+        action = form.get("action") or "advancedSearchResults.do?action=firstPage"
+        return self.http.post_form(urljoin(response.url, action), data)
+
+    def _advanced_search_dates(
+        self,
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        form_data: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        data: dict[str, str] = {}
+        if start_date:
+            data[self._advanced_date_field(form_data, "start")] = start_date.strftime("%d/%m/%Y")
+        if end_date:
+            data[self._advanced_date_field(form_data, "end")] = end_date.strftime("%d/%m/%Y")
+        return data
+
+    def _advanced_date_field(self, form_data: dict[str, str] | None, which: str) -> str:
+        if not form_data:
+            return "searchCriteria.dateReceivedStart" if which == "start" else "searchCriteria.dateReceivedEnd"
+        candidates = (
+            ("date(applicationReceivedStart)", "searchCriteria.dateReceivedStart", "date(applicationValidatedStart)")
+            if which == "start"
+            else ("date(applicationReceivedEnd)", "searchCriteria.dateReceivedEnd", "date(applicationValidatedEnd)")
+        )
+        for candidate in candidates:
+            if candidate in form_data:
+                return candidate
+        return candidates[1]
+
+    def _form_defaults(self, form: html.HtmlElement) -> dict[str, str]:
+        data: dict[str, str] = {}
+        for input_node in form.xpath(".//input[@name]"):
+            name = input_node.get("name")
+            input_type = (input_node.get("type") or "text").lower()
+            if input_type in {"submit", "button", "image", "reset"}:
+                continue
+            if input_type in {"radio", "checkbox"} and input_node.get("checked") is None and name in data:
+                continue
+            data[name] = input_node.get("value") or ""
+        for select in form.xpath(".//select[@name]"):
+            chosen = (select.xpath(".//option[@selected]") or select.xpath(".//option")[:1])
+            if chosen:
+                option_value = chosen[0].get("value")
+                data[select.get("name")] = option_value if option_value is not None else clean_text(" ".join(chosen[0].itertext())) or ""
+        return data
+
+    def _portal_url(self, path: str) -> str:
+        return urljoin(self.config.base_url.rstrip("/") + "/", self.config.application_root.strip("/") + "/" + path)
+
+    def _summary_url(self, page_url: str, uid: str) -> str:
+        return urljoin(page_url, f"applicationDetails.do?{urlencode({'activeTab': 'summary', 'keyVal': uid})}")
+
+    def _extract_uid(self, url_or_href: str | None) -> str | None:
+        if not url_or_href:
+            return None
+        query = parse_qs(urlsplit(url_or_href).query)
+        key_val = query.get("keyVal") or query.get("keyval")
+        if key_val and key_val[0]:
+            return key_val[0]
+        match = re.search(r"\bkeyVal=([^&#]+)", url_or_href, flags=re.IGNORECASE)
+        return match.group(1) if match else None
+
+    def _nearest_row_text(self, anchor: html.HtmlElement) -> str | None:
+        row = anchor.xpath("ancestor::tr[1]")
+        if row:
+            return clean_text(" ".join(row[0].itertext()))
+        item = anchor.xpath("ancestor::li[1] | ancestor::article[1] | ancestor::div[contains(@class, 'searchresult')][1]")
+        if item:
+            return clean_text(" ".join(item[0].itertext()))
+        return clean_text(" ".join(anchor.itertext()))
+
+    def _extract_reference(self, anchor: html.HtmlElement, row_text: str | None) -> str | None:
+        if row_text:
+            labelled_match = re.search(
+                r"\b(?:Ref(?:erence)?\.?\s*(?:No\.?)?|Application\s+(?:No\.?|Number|Reference))\s*:\s*"
+                rf"({IDOX_REFERENCE_RE.pattern})",
+                row_text,
+                flags=re.IGNORECASE,
+            )
+            if labelled_match:
+                nested_match = IDOX_REFERENCE_RE.search(labelled_match.group(1))
+                if nested_match:
+                    return nested_match.group(0)
+        for value in (clean_text(" ".join(anchor.itertext())), row_text):
+            if value:
+                match = IDOX_REFERENCE_RE.search(value)
+                if match:
+                    return match.group(0)
+        return clean_text(" ".join(anchor.itertext()))
+
+    def _extract_address(self, row_text: str | None, reference: str | None) -> str | None:
+        if not row_text:
+            return None
+        text = row_text.replace(reference, " ") if reference else row_text
+        return clean_text(re.sub(r"\b(Application|Reference|Validated|Received|Status)\b:?", " ", text, flags=re.IGNORECASE))
+
+    def _result_item(self, anchor: html.HtmlElement) -> html.HtmlElement | None:
+        items = anchor.xpath(
+            "ancestor::li[contains(concat(' ', normalize-space(@class), ' '), ' searchresult ')][1] "
+            "| ancestor::article[1] "
+            "| ancestor::div[contains(concat(' ', normalize-space(@class), ' '), ' searchresult ')][1]"
+        )
+        return items[0] if items else None
+
+    def _class_text(self, container: html.HtmlElement | None, class_name: str) -> str | None:
+        if container is None:
+            return None
+        nodes = container.xpath(
+            f".//*[contains(concat(' ', normalize-space(@class), ' '), ' {class_name} ')]"
+        )
+        if not nodes:
+            return None
+        return clean_text(" ".join(nodes[0].itertext()))
+
+    def _listing_description(
+        self,
+        anchor: html.HtmlElement,
+        container: html.HtmlElement | None,
+        reference: str | None,
+    ) -> str | None:
+        description = self._class_text(container, "summaryLinkTextClamp")
+        if description:
+            return description
+        anchor_text = clean_text(" ".join(anchor.itertext()))
+        if not anchor_text or anchor_text == reference:
+            return None
+        return anchor_text
+
+    def _status_text(self, container: html.HtmlElement | None) -> str | None:
+        if container is None:
+            return None
+        nodes = container.xpath(
+            ".//*[contains(concat(' ', normalize-space(@class), ' '), ' badge-status ')]"
+            "//*[contains(concat(' ', normalize-space(@class), ' '), ' value ')]"
+        )
+        return clean_text(" ".join(nodes[0].itertext())) if nodes else None
+
+    def _listing_date(self, container: html.HtmlElement | None, label: str) -> str | None:
+        meta_text = self._class_text(container, "metaInfo")
+        if not meta_text:
+            return None
+        match = re.search(
+            rf"\b{re.escape(label)}\s*:\s*("
+            r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{1,2}\s+\w+\s+\d{4}"
+            r"|\d{1,2}[/-]\d{1,2}[/-]\d{4}"
+            r")",
+            meta_text,
+            flags=re.IGNORECASE,
+        )
+        return parse_council_date(match.group(1)) if match else None
+
+    def _extract_labelled_fields(self, document: html.HtmlElement) -> dict[str, str]:
+        fields: dict[str, str] = {}
+        for row in document.xpath("//tr[th and td]"):
+            label = clean_text(" ".join(row.xpath("./th[1]//text()")))
+            value = clean_text(" ".join(row.xpath("./td[1]//text()")))
+            if label and value:
+                fields[label] = value
+        for container in document.xpath("//dl"):
+            for term in container.xpath("./dt"):
+                label = clean_text(" ".join(term.itertext()))
+                values: list[str] = []
+                sibling = term.getnext()
+                while sibling is not None and sibling.tag.lower() != "dt":
+                    if sibling.tag.lower() == "dd":
+                        text = clean_text(" ".join(sibling.itertext()))
+                        if text:
+                            values.append(text)
+                    sibling = sibling.getnext()
+                if label and values:
+                    fields[label] = clean_text(" ".join(values)) or values[0]
+        for label_node in document.xpath("//*[contains(@class, 'field') or contains(@class, 'label')]"):
+            label = clean_text(" ".join(label_node.itertext()))
+            value_node = label_node.getnext()
+            if label and value_node is not None:
+                value = clean_text(" ".join(value_node.itertext()))
+                if value:
+                    fields.setdefault(label, value)
+        for input_node in document.xpath("//input[@name and @value]"):
+            if (input_node.get("type") or "").lower() == "hidden":
+                label = input_node.get("name")
+                value = clean_text(input_node.get("value"))
+                if label and value and not self._is_transient_form_field(label):
+                    fields.setdefault(label, value)
+        return fields
+
+    def _is_document_href(self, href: str | None) -> bool:
+        if not href:
+            return False
+        href_lower = href.lower()
+        if "applicationdetails.do" in href_lower:
+            return False
+        return any(marker in href_lower for marker in ("documentdownload", "documentviewer", "document.do", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".jpg", ".jpeg", ".png"))
+
+    def _document_title_from_url(self, url: str) -> str:
+        query = parse_qs(urlsplit(url).query)
+        for key in ("name", "docName", "documentName", "filename"):
+            if query.get(key):
+                return query[key][0]
+        return urlsplit(url).path.rstrip("/").rsplit("/", 1)[-1] or "Document"
+
+    def _document_metadata(self, cells: list[str], row_text: str | None, title: str) -> dict[str, str]:
+        metadata: dict[str, str] = {}
+        for cell in [cell for cell in cells if cell != title]:
+            normalized = normalize_label(cell)
+            if re.search(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b", cell) or re.search(r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{1,2}\s+\w+\s+\d{4}\b", cell):
+                metadata.setdefault("date_published", cell)
+            elif re.search(r"\b\d+(?:\.\d+)?\s*(?:kb|mb|gb)\b", cell, flags=re.IGNORECASE):
+                metadata.setdefault("file_size", cell)
+            elif normalized in {"drawing", "plan", "decision_notice", "application_form", "supporting_document"}:
+                metadata.setdefault("document_type", cell)
+            else:
+                metadata.setdefault("description", cell)
+        if row_text and not metadata.get("date_published"):
+            match = re.search(r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{4}|(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{1,2}\s+\w+\s+\d{4})\b", row_text)
+            if match:
+                metadata["date_published"] = match.group(0)
+        return metadata
+
+    def _raw_value(self, raw: dict[str, str], *normalized_labels: str) -> str | None:
+        for label, value in raw.items():
+            if normalize_label(label) in set(normalized_labels):
+                return value
+        return None
+
+    def _looks_like_application_summary(self, document: html.HtmlElement) -> bool:
+        return "application summary" in (clean_text(" ".join(document.xpath("//h1//text() | //title//text()"))) or "").lower()
+
+    def _is_transient_form_field(self, label: str) -> bool:
+        normalized = normalize_label(label)
+        return normalized.startswith("_") or "token" in normalized or normalized == "csrf"
