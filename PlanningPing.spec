@@ -14,7 +14,7 @@ SELENIUM_BROWSER_IMPORTS = [
 TKINTERDND_DATA = collect_data_files("tkinterdnd2")
 
 a = Analysis(
-    ["src\\planning_ping\\ui\\app.py"],
+    ["src\\planning_ping\\__main__.py"],
     pathex=["src"],
     binaries=[],
     datas=[
