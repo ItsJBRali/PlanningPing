@@ -161,6 +161,7 @@ class GenericLabelledPlanningScraper(PlanningScraper):
         application = self.parse_detail(response.text, response.url, fallback_uid=uid)
         if include_documents:
             application.documents = self.parse_documents(response.text, response.url)
+            application.documents_complete = True
         return application
 
     def parse_listing(self, html_text: str, page_url: str) -> list[PlanningApplication]:

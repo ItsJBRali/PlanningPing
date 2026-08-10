@@ -84,6 +84,7 @@ class CivicaPlanningScraper(GenericLabelledPlanningScraper):
             application = self._fetch_keyobject_application(uid, url)
             if include_documents:
                 application.documents = fetch_civica_documents_from_raw(application.raw, source_url=application.url)
+                application.documents_complete = True
             return application
         if url and self._looks_like_webforms_detail(url):
             return self._fetch_webforms_application(uid, url)

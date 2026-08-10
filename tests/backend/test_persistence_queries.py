@@ -36,6 +36,7 @@ def application(
     postcode: str = "EX1 1AA",
     status: str = "Pending",
     documents: tuple[ApplicationDocument, ...] = (),
+    documents_complete: bool = False,
 ) -> PlanningApplication:
     return PlanningApplication(
         council_code=council_code,
@@ -55,6 +56,7 @@ def application(
         scraped_at=FIRST,
         raw={"reference": reference},
         documents=documents,
+        documents_complete=documents_complete,
     )
 
 
@@ -67,6 +69,26 @@ class MutableClock:
 
 
 class PersistenceTests(unittest.TestCase):
+    def test_document_pruning_requires_an_explicit_complete_listing(self) -> None:
+        run_id = self._begin_run()
+        first = ApplicationDocument("First", "https://alpha.test/doc/1")
+        second = ApplicationDocument("Second", "https://alpha.test/doc/2")
+        self.database.save_council_result(
+            run_id, council(), [application("24/001", documents=(first, second), documents_complete=True)], outcome="success"
+        )
+
+        self.database.save_council_result(
+            run_id, council(), [application("24/001", documents=(first,), documents_complete=False)], outcome="success"
+        )
+        urls = {row[0] for row in self.database.connection.execute("SELECT document_url FROM application_documents")}
+        self.assertEqual({first.document_url, second.document_url}, urls)
+
+        self.database.save_council_result(
+            run_id, council(), [application("24/001", documents=(first,), documents_complete=True)], outcome="success"
+        )
+        urls = {row[0] for row in self.database.connection.execute("SELECT document_url FROM application_documents")}
+        self.assertEqual({first.document_url}, urls)
+
     def setUp(self) -> None:
         self.temp_directory = tempfile.TemporaryDirectory()
         self.path = Path(self.temp_directory.name) / "applications.sql"

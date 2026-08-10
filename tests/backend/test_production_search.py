@@ -126,6 +126,37 @@ class FakePlanItHttp:
 
 
 class ProductionAuthoritySearchTests(unittest.TestCase):
+    def test_detail_fetch_preserves_kensington_discovery_coordinates_and_documents(self) -> None:
+        discovery_document = PlanningDocument("Map", "https://alpha.test/map")
+
+        class KensingtonLikeScraper(FakeScraper):
+            def discover_ids(self, **kwargs: object) -> DiscoveryResult:
+                return DiscoveryResult(
+                    "Alpha",
+                    "https://alpha.test/search",
+                    [AdapterApplication(
+                        "Alpha", "UID1", "https://alpha.test/UID1", reference="24/A",
+                        address="Discovery address", documents=[discovery_document],
+                        raw={"record": {"longitude": 8.0, "latitude": 8.0, "uprn": "1"}, "docs_url": "https://alpha.test/docs"},
+                    )],
+                )
+
+            def fetch_application(self, uid: str, url: str | None = None, *, include_documents: bool = False) -> AdapterApplication:
+                return AdapterApplication(
+                    "Alpha", uid, url or "", reference="24/A", address="Detail address",
+                    description="Detail description", date_received="2026-01-05",
+                    raw={"record": {"current_stage": "Pending"}},
+                )
+
+        application = ProductionAuthoritySearcher(scraper_factory=lambda _: KensingtonLikeScraper()).search_primary(
+            council(), date(2026, 1, 1), date(2026, 1, 31), Event()
+        ).applications[0]
+        self.assertEqual("Detail address", application.address)
+        self.assertEqual((8.0, 8.0), (application.longitude, application.latitude))
+        self.assertEqual("1", application.raw["record"]["uprn"])
+        self.assertEqual("https://alpha.test/map", application.documents[0].document_url)
+        self.assertIsNone(location_match_quality(application.longitude, application.latitude, [BOUNDARY]))
+
     def test_dispatches_supported_family_and_never_routes_unknown_generically(self) -> None:
         self.assertIsInstance(scraper_for_council(council()), IdoxPublicAccessScraper)
         with self.assertRaisesRegex(UnsupportedPortalError, "unknown"):

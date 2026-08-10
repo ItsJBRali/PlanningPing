@@ -99,7 +99,7 @@ class PlanningSearchService:
                     kind="council_started",
                     run_id=run_id,
                     council=council.name,
-                    completed=len(states),
+                    completed=0,
                     total=len(councils),
                 )
             )

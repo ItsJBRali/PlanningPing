@@ -677,7 +677,6 @@ class CouncilBrowserClient:
         for argument in (
             "--disable-gpu",
             "--disable-dev-shm-usage",
-            "--no-sandbox",
             "--window-size=1280,1000",
             "--window-position=-32000,-32000",
             "--lang=en-GB",

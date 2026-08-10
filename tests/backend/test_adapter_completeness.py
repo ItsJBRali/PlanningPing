@@ -17,9 +17,9 @@ from planning_ping.backend.adapters.idox import IdoxCouncilConfig, IdoxPublicAcc
 from planning_ping.backend.adapters.northgate import NorthgateCouncilConfig, NorthgatePlanningScraper
 from planning_ping.backend.adapters.ocella import OcellaCouncilConfig, OcellaPlanningScraper
 from planning_ping.backend.adapters.wiltshire import WiltshireCouncilConfig, WiltshirePlanningScraper
-from planning_ping.backend.adapters.bespoke_portals import ColchesterPlanningScraper
+from planning_ping.backend.adapters.bespoke_portals import ColchesterPlanningScraper, TelfordPlanningScraper
 from planning_ping.backend.adapters.legacy_forms import LegacyFormsCouncilConfig
-from planning_ping.backend.http import FetchResponse
+from planning_ping.backend.http import BinaryFetchResponse, CouncilFetchError, CouncilHttpClient, FetchResponse, monitor_council_requests
 
 
 def application(uid: str = "UID1") -> PlanningApplication:
@@ -46,6 +46,70 @@ class MappingHttp:
 
 
 class AdapterCompletenessTests(unittest.TestCase):
+    def test_modern_agile_api_uses_shared_binary_transport_and_honours_cancellation(self) -> None:
+        class BinaryHttp:
+            user_agent = "test-agent"
+
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict[str, str], dict[str, str]]] = []
+
+            def get_bytes(self, url: str, params: dict[str, str], headers: dict[str, str]) -> BinaryFetchResponse:
+                self.calls.append((url, params, headers))
+                return BinaryFetchResponse(url=f"{url}?status=registered", status_code=200, body=b'{"results": []}')
+
+        http = BinaryHttp()
+        agile = AgilePlanningScraper(AgileCouncilConfig("Example", "https://planning.example.test"), http_client=http)  # type: ignore[arg-type]
+        text, final_url = agile._api_get("application/search", {"status": "registered"}, "EX")
+        self.assertEqual('{"results": []}', text)
+        self.assertEqual("https://planningapi.agileapplications.co.uk//api/application/search", http.calls[0][0])
+        self.assertEqual("registered", http.calls[0][1]["status"])
+        self.assertEqual("EX", http.calls[0][2]["x-client"])
+        self.assertIn("status=registered", final_url)
+
+        class CancelledClient(CouncilHttpClient):
+            def _opener(self):
+                raise AssertionError("cancelled Agile request reached the network")
+
+        cancelled = AgilePlanningScraper(
+            AgileCouncilConfig("Example", "https://planning.example.test"),
+            http_client=CancelledClient(min_delay_seconds=0),
+        )
+        with monitor_council_requests(lambda: None, should_cancel=lambda: True):
+            with self.assertRaisesRegex(CouncilFetchError, "cancelled"):
+                cancelled._api_get("application/search", {}, "EX")
+
+    def test_telford_rejects_an_unproven_exact_ten_cap_but_accepts_below_cap(self) -> None:
+        class TelfordHttp:
+            def __init__(self, count: int) -> None:
+                self.count = count
+
+            def get(self, url: str, **_: object) -> FetchResponse:
+                return FetchResponse(
+                    url=url,
+                    status_code=200,
+                    text='<form><input name="ctl00$ContentPlaceHolder1$DCdatefrom"></form>',
+                )
+
+            def post_form(self, url: str, data: object, **_: object) -> FetchResponse:
+                rows = "".join(
+                    f'<tr><td><a href="PA-ApplicationSummary.aspx?id={index}">24/{index:04d}</a></td>'
+                    '<td>01/01/2026</td><td>1 High Street</td><td>Extension</td></tr>'
+                    for index in range(self.count)
+                )
+                return FetchResponse(url=url, status_code=200, text=f"<table>{rows}</table>")
+
+        exact = TelfordPlanningScraper(
+            LegacyFormsCouncilConfig("Telford", "https://planning.example.test"),
+            http_client=TelfordHttp(10),  # type: ignore[arg-type]
+        )
+        with self.assertRaisesRegex(PortalSearchCompletenessError, "10|cap|complete"):
+            exact._search_day("https://planning.example.test/search", date(2026, 1, 1))
+
+        below = TelfordPlanningScraper(
+            LegacyFormsCouncilConfig("Telford", "https://planning.example.test"),
+            http_client=TelfordHttp(9),  # type: ignore[arg-type]
+        )
+        self.assertEqual(9, len(below._search_day("https://planning.example.test/search", date(2026, 1, 1))))
     def test_idox_raises_at_page_cap_instead_of_returning_a_prefix(self) -> None:
         first = FetchResponse(
             url="https://planning.example.test/search",
