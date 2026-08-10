@@ -12,64 +12,81 @@ from planning_ping import contracts
 
 
 class ContractModelsTests(unittest.TestCase):
-    """Break caught: UI/service boundaries could expose mutable or incomplete data."""
+    """Break caught: the UI/service API could drift from the approved fields."""
 
-    def test_application_rows_can_be_returned_in_a_typed_page(self) -> None:
+    def test_application_rows_expose_searchable_planning_fields(self) -> None:
         row = contracts.ApplicationRow(
-            application_id="application-1",
+            application_id=7,
             reference="24/00001/FUL",
-            description="Single-storey rear extension",
-            address="1 High Street, Exampleton",
-            local_authority="Example Council",
-            region="England",
+            council="Example Council",
+            application_date=date(2026, 1, 7),
             received_date=date(2026, 1, 7),
             validated_date=None,
+            description="Single-storey rear extension",
+            address="1 High Street, Exampleton",
+            postcode="EX1 1AA",
             status="Pending consideration",
-            source_url="https://planning.example.test/application-1",
+            application_url="https://planning.example.test/application-1",
+            council_url="https://planning.example.test",
         )
         page = contracts.Page(items=(row,), page=1, page_size=50, total_items=1)
 
-        self.assertEqual((row,), page.items)
-        self.assertEqual(1, page.total_items)
-        self.assertEqual("24/00001/FUL", page.items[0].reference)
+        self.assertEqual(7, page.items[0].application_id)
+        self.assertEqual("Example Council", page.items[0].council)
+        self.assertEqual(date(2026, 1, 7), page.items[0].application_date)
+        self.assertEqual("EX1 1AA", page.items[0].postcode)
 
-    def test_search_events_and_summaries_preserve_run_outcome(self) -> None:
+    def test_search_events_preserve_structured_progress(self) -> None:
+        event = contracts.SearchEvent(
+            kind="council_finished",
+            run_id=4,
+            council="Example Council",
+            completed=2,
+            total=10,
+            saved_count=3,
+            message="Saved 3 applications",
+        )
+
+        self.assertEqual("council_finished", event.kind)
+        self.assertEqual(4, event.run_id)
+        self.assertEqual(2, event.completed)
+        self.assertEqual(3, event.saved_count)
+
+    def test_search_summary_exposes_terminal_aggregate_counts(self) -> None:
         started_at = datetime(2026, 1, 31, 9, 0, tzinfo=timezone.utc)
         finished_at = datetime(2026, 1, 31, 9, 3, tzinfo=timezone.utc)
-        event = contracts.SearchEvent(
-            kind="progress",
-            message="Searching Example Council",
-            current=2,
-            total=10,
-            run_id="run-1",
-        )
         summary = contracts.SearchSummary(
-            run_id="run-1",
+            run_id=4,
+            status="completed_with_issues",
+            total_councils=10,
+            searched_councils=10,
+            saved_applications=12,
+            empty_councils=2,
+            failed_councils=1,
             started_at=started_at,
             finished_at=finished_at,
-            applications_found=12,
-            applications_saved=10,
-            issues_created=2,
         )
 
-        self.assertEqual("progress", event.kind)
-        self.assertEqual(2, event.current)
-        self.assertEqual(12, summary.applications_found)
-        self.assertFalse(summary.cancelled)
+        self.assertEqual("completed_with_issues", summary.status)
+        self.assertEqual(12, summary.saved_applications)
+        self.assertEqual(1, summary.failed_councils)
 
-    def test_issue_rows_identify_run_severity_and_time(self) -> None:
-        created_at = datetime(2026, 1, 31, 9, 1, tzinfo=timezone.utc)
+    def test_issue_rows_identify_council_outcome_and_error(self) -> None:
+        timestamp = datetime(2026, 1, 31, 9, 1, tzinfo=timezone.utc)
         issue = contracts.IssueRow(
-            issue_id="issue-1",
-            run_id="run-1",
-            severity="warning",
+            issue_id=9,
+            run_id=4,
+            timestamp=timestamp,
+            council="Example Council",
+            portal_family="idox",
+            outcome="error",
+            error_type="CompletenessError",
             message="Portal returned incomplete results",
-            created_at=created_at,
-            application_reference="24/00001/FUL",
         )
 
-        self.assertEqual("warning", issue.severity)
-        self.assertEqual(created_at, issue.created_at)
+        self.assertEqual("error", issue.outcome)
+        self.assertEqual("idox", issue.portal_family)
+        self.assertEqual(timestamp, issue.timestamp)
 
     def test_service_bundle_exposes_the_frozen_protocol_boundaries(self) -> None:
         services = contracts.AppServices(
@@ -84,12 +101,7 @@ class ContractModelsTests(unittest.TestCase):
 
 
 class _SearchServiceFake:
-    def run(
-        self,
-        request: object,
-        emit: object,
-        cancel_event: Event,
-    ) -> object:
+    def run(self, request: object, emit: object, cancel_event: Event) -> object:
         return object()
 
 
@@ -99,7 +111,7 @@ class _ApplicationQueryServiceFake:
 
 
 class _IssueQueryServiceFake:
-    def list_issues(self, run_id: str | None = None) -> tuple[object, ...]:
+    def list_issues(self, run_id: int | None = None) -> tuple[object, ...]:
         return ()
 
 
