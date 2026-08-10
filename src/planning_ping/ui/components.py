@@ -103,6 +103,8 @@ class ScrollableTable(ctk.CTkFrame):
         self._canvas.bind("<Configure>", self._sync_content_width)
         self._canvas.bind("<Left>", lambda _event: self._scroll_x(-1))
         self._canvas.bind("<Right>", lambda _event: self._scroll_x(1))
+        self.register_mousewheel_target(self._canvas)
+        self.register_mousewheel_target(self.content)
 
     def _sync_scroll_region(self, _event=None) -> None:
         bounds = self._canvas.bbox("all")
@@ -117,6 +119,36 @@ class ScrollableTable(ctk.CTkFrame):
     def _scroll_x(self, units: int):
         self._canvas.xview_scroll(units, "units")
         return "break"
+
+    @staticmethod
+    def _wheel_steps(delta: int) -> int:
+        if delta == 0:
+            return 0
+        direction = 1 if delta > 0 else -1
+        return direction * max(1, abs(delta) // 120)
+
+    def _on_mousewheel(self, event):
+        steps = self._wheel_steps(event.delta)
+        if steps:
+            self._canvas.yview_scroll(-steps, "units")
+            return "break"
+        return None
+
+    def register_mousewheel_target(self, widget) -> None:
+        """Keep wheel handling scoped to this table and its rendered cells."""
+
+        targets = (
+            widget,
+            getattr(widget, "_canvas", None),
+            getattr(widget, "_text_label", None),
+            getattr(widget, "_image_label", None),
+        )
+        seen: set[str] = set()
+        for target in targets:
+            if target is None or str(target) in seen:
+                continue
+            seen.add(str(target))
+            tk.Misc.bind(target, "<MouseWheel>", self._on_mousewheel, add="+")
 
     def xview(self) -> tuple[float, float]:
         return self._canvas.xview()

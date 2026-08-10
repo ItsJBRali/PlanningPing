@@ -17,23 +17,35 @@ class PlanningPingAppSmokeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         now = datetime(2026, 1, 1)
+        issue_rows = (
+            IssueRow(
+                issue_id=1,
+                run_id=0,
+                timestamp=datetime(2026, 1, 2, 12, 30),
+                council="Zero Council",
+                portal_family="Idox",
+                outcome="failed",
+                error_type="Timeout",
+                message="Portal timed out",
+            ),
+            *(
+                IssueRow(
+                    issue_id=index,
+                    run_id=index,
+                    timestamp=datetime(2026, 1, 2, 12, 30),
+                    council=f"Council {index}",
+                    portal_family="Idox",
+                    outcome="warning",
+                    error_type=None,
+                    message="Partial result",
+                )
+                for index in range(2, 52)
+            ),
+        )
         services = AppServices(
             search=FakeSearchService(SearchSummary(1, "completed", 0, 0, 0, 0, 0, now, now)),
             applications=FakeApplicationQueryService((Page((), 1, 50, 0),)),
-            issues=FakeIssueQueryService(
-                (
-                    IssueRow(
-                        issue_id=1,
-                        run_id=0,
-                        timestamp=datetime(2026, 1, 2, 12, 30),
-                        council="Zero Council",
-                        portal_family="Idox",
-                        outcome="failed",
-                        error_type="Timeout",
-                        message="Portal timed out",
-                    ),
-                )
-            ),
+            issues=FakeIssueQueryService(issue_rows),
         )
         try:
             cls.app = PlanningPingApp(services)
@@ -153,6 +165,36 @@ class PlanningPingAppSmokeTests(unittest.TestCase):
                 end_first, end_last = table.xview()
                 self.assertGreater(end_first, start_first)
                 self.assertAlmostEqual(end_last, 1.0, places=4)
+        finally:
+            self.app.geometry("1280x800")
+            self.app.withdraw()
+
+    def test_issue_table_mouse_wheel_scrolls_only_over_table_content(self) -> None:
+        self.app.navigate("view_issues")
+        issues = self.app.screens["view_issues"]
+        issues.run_var.set("")
+        issues.outcome_var.set("All outcomes")
+        issues._load()
+        self._drain_query(issues)
+        self.app.geometry("1024x680")
+        self.app.deiconify()
+        self.app.update()
+        try:
+            table = issues.table
+            start_first, start_last = table._canvas.yview()
+            self.assertLess(start_last - start_first, 1.0)
+            first_row_cell = table.content.grid_slaves(row=1, column=0)[0]
+            first_row_cell.event_generate("<MouseWheel>", delta=-120, when="now")
+            self.app.update()
+            moved_first, _ = table._canvas.yview()
+            self.assertGreater(moved_first, start_first)
+
+            table._canvas.yview_moveto(0.0)
+            self.app.update_idletasks()
+            issues.load_button.event_generate("<MouseWheel>", delta=-120, when="now")
+            self.app.update()
+            unrelated_first, _ = table._canvas.yview()
+            self.assertAlmostEqual(unrelated_first, start_first, places=4)
         finally:
             self.app.geometry("1280x800")
             self.app.withdraw()

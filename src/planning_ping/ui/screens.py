@@ -325,6 +325,7 @@ class SearchSavedScreen(BaseScreen):
             else:
                 heading = ctk.CTkLabel(content, text=label, font=TYPE["heading"])
             heading.grid(row=0, column=column_index, sticky="ew", padx=2, pady=2)
+            self.table.register_mousewheel_target(heading)
         if self.model.error_message:
             self.status_var.set(f"Error: {self.model.error_message}")
         elif not self.model.rows:
@@ -348,10 +349,13 @@ class SearchSavedScreen(BaseScreen):
                     )
                     button.grid(row=row_index, column=column_index, padx=2, pady=2)
                     self.link_buttons.append(button)
+                    self.table.register_mousewheel_target(button)
                 else:
-                    ctk.CTkLabel(content, text=value, anchor="w", justify="left", wraplength=260).grid(
+                    cell = ctk.CTkLabel(content, text=value, anchor="w", justify="left", wraplength=260)
+                    cell.grid(
                         row=row_index, column=column_index, sticky="nw", padx=4, pady=3
                     )
+                    self.table.register_mousewheel_target(cell)
         self.page_var.set(f"Page {self.model.page} of {self.model.total_pages} · {self.model.total_items} results")
         self.previous_button.configure(state="normal" if self.model.page > 1 else "disabled")
         self.next_button.configure(state="normal" if self.model.page < self.model.total_pages else "disabled")
@@ -480,7 +484,9 @@ class IssuesScreen(BaseScreen):
             child.destroy()
         for index, heading in enumerate(self.COLUMNS):
             content.grid_columnconfigure(index, minsize=self.COLUMN_WIDTHS[index])
-            ctk.CTkLabel(content, text=heading, font=TYPE["heading"]).grid(row=0, column=index, padx=SPACING["sm"], pady=SPACING["sm"])
+            heading_label = ctk.CTkLabel(content, text=heading, font=TYPE["heading"])
+            heading_label.grid(row=0, column=index, padx=SPACING["sm"], pady=SPACING["sm"])
+            self.table.register_mousewheel_target(heading_label)
         if self.model.error_message:
             self.status_var.set(f"Error: {self.model.error_message}")
         elif not self.model.rows:
@@ -492,6 +498,8 @@ class IssuesScreen(BaseScreen):
             run_id = "" if row.run_id is None else str(row.run_id)
             values = (row.timestamp.isoformat(sep=" ", timespec="seconds"), run_id, row.council, row.portal_family, row.outcome, error)
             for column_index, value in enumerate(values):
-                ctk.CTkLabel(content, text=value, anchor="w", justify="left", wraplength=300).grid(
+                cell = ctk.CTkLabel(content, text=value, anchor="w", justify="left", wraplength=300)
+                cell.grid(
                     row=row_index, column=column_index, sticky="nw", padx=SPACING["sm"], pady=SPACING["xs"]
                 )
+                self.table.register_mousewheel_target(cell)
