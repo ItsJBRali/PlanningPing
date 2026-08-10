@@ -333,7 +333,7 @@ def _merge_discovery_details(discovery: AdapterApplication, details: AdapterAppl
         if detail_value is None or isinstance(detail_value, str) and not detail_value.strip():
             setattr(details, name, getattr(discovery, name))
     details.raw = _merge_raw(discovery.raw, details.raw)
-    if not details.documents:
+    if not details.documents and not details.documents_complete:
         details.documents = list(discovery.documents)
         details.documents_complete = discovery.documents_complete
     return details

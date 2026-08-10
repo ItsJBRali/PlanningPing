@@ -155,7 +155,51 @@ class ProductionAuthoritySearchTests(unittest.TestCase):
         self.assertEqual((8.0, 8.0), (application.longitude, application.latitude))
         self.assertEqual("1", application.raw["record"]["uprn"])
         self.assertEqual("https://alpha.test/map", application.documents[0].document_url)
+        self.assertFalse(application.documents_complete)
         self.assertIsNone(location_match_quality(application.longitude, application.latitude, [BOUNDARY]))
+
+    def test_complete_empty_detail_document_listing_does_not_inherit_stale_discovery_documents(self) -> None:
+        stale_document = PlanningDocument("Old plan", "https://alpha.test/old-plan")
+
+        class CompleteEmptyDetailScraper(FakeScraper):
+            def discover_ids(self, **kwargs: object) -> DiscoveryResult:
+                return DiscoveryResult(
+                    "Alpha",
+                    "https://alpha.test/search",
+                    [AdapterApplication(
+                        "Alpha",
+                        "UID1",
+                        "https://alpha.test/UID1",
+                        reference="24/A",
+                        documents=[stale_document],
+                        documents_complete=False,
+                    )],
+                )
+
+            def fetch_application(
+                self,
+                uid: str,
+                url: str | None = None,
+                *,
+                include_documents: bool = False,
+            ) -> AdapterApplication:
+                return AdapterApplication(
+                    "Alpha",
+                    uid,
+                    url or "",
+                    reference="24/A",
+                    description="Detail description",
+                    date_received="2026-01-05",
+                    documents=[],
+                    documents_complete=True,
+                )
+
+        application = ProductionAuthoritySearcher(
+            scraper_factory=lambda _: CompleteEmptyDetailScraper()
+        ).search_primary(council(), date(2026, 1, 1), date(2026, 1, 31), Event()).applications[0]
+
+        self.assertEqual((), application.documents)
+        self.assertTrue(application.documents_complete)
 
     def test_dispatches_supported_family_and_never_routes_unknown_generically(self) -> None:
         self.assertIsInstance(scraper_for_council(council()), IdoxPublicAccessScraper)
