@@ -66,6 +66,65 @@ class PageHeader(ctk.CTkFrame):
         ).pack(fill="x", pady=(SPACING["xs"], 0))
 
 
+class ScrollableTable(ctk.CTkFrame):
+    """A two-axis table viewport with visible horizontal navigation."""
+
+    def __init__(self, master, *, min_content_width: int):
+        super().__init__(master, fg_color=COLORS["surface"])
+        self._min_content_width = min_content_width
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        self._canvas = tk.Canvas(
+            self,
+            background=COLORS["surface"],
+            highlightthickness=0,
+            takefocus=True,
+        )
+        self._canvas.grid(row=0, column=0, sticky="nsew")
+        self.vertical_scrollbar = ctk.CTkScrollbar(
+            self,
+            orientation="vertical",
+            command=self._canvas.yview,
+        )
+        self.vertical_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.horizontal_scrollbar = ctk.CTkScrollbar(
+            self,
+            orientation="horizontal",
+            command=self._canvas.xview,
+        )
+        self.horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
+        self._canvas.configure(
+            xscrollcommand=self.horizontal_scrollbar.set,
+            yscrollcommand=self.vertical_scrollbar.set,
+        )
+        self.content = ctk.CTkFrame(self._canvas, fg_color=COLORS["surface"], corner_radius=0)
+        self._window_id = self._canvas.create_window(0, 0, window=self.content, anchor="nw")
+        self.content.bind("<Configure>", self._sync_scroll_region)
+        self._canvas.bind("<Configure>", self._sync_content_width)
+        self._canvas.bind("<Left>", lambda _event: self._scroll_x(-1))
+        self._canvas.bind("<Right>", lambda _event: self._scroll_x(1))
+
+    def _sync_scroll_region(self, _event=None) -> None:
+        bounds = self._canvas.bbox("all")
+        if bounds is not None:
+            self._canvas.configure(scrollregion=bounds)
+
+    def _sync_content_width(self, event) -> None:
+        width = max(event.width, self._min_content_width, self.content.winfo_reqwidth())
+        self._canvas.itemconfigure(self._window_id, width=width)
+        self._sync_scroll_region()
+
+    def _scroll_x(self, units: int):
+        self._canvas.xview_scroll(units, "units")
+        return "break"
+
+    def xview(self) -> tuple[float, float]:
+        return self._canvas.xview()
+
+    def xview_moveto(self, fraction: float) -> None:
+        self._canvas.xview_moveto(fraction)
+
+
 class BaseScreen(ctk.CTkFrame):
     def __init__(self, master):
         super().__init__(master, fg_color=COLORS["background"])

@@ -12,7 +12,7 @@ from tkinterdnd2 import COPY, DND_FILES
 
 from planning_ping.contracts import ApplicationQueryService, IssueQueryService, SearchService
 
-from .components import BaseScreen, FocusButton, PageHeader
+from .components import BaseScreen, FocusButton, PageHeader, ScrollableTable
 from .controllers import BackgroundTaskController, SearchController, SearchViewState
 from .models import (
     IssueResultsModel,
@@ -206,6 +206,7 @@ class SearchSavedScreen(BaseScreen):
         ("address", "Address"), ("postcode", "Postcode"), ("description", "Description"),
         ("status", "Status"), ("application_url", "Application Link"), ("council_url", "Council Link"),
     )
+    COLUMN_WIDTHS = (140, 160, 140, 220, 110, 280, 110, 120, 120)
 
     def __init__(self, master, service: ApplicationQueryService):
         super().__init__(master)
@@ -241,7 +242,7 @@ class SearchSavedScreen(BaseScreen):
         self.search_button = FocusButton(buttons, text="Search", command=self._search)
         self.search_button.pack(side="left", padx=SPACING["sm"])
         ctk.CTkLabel(buttons, textvariable=self.status_var, anchor="w").pack(side="left", padx=SPACING["md"])
-        self.table = ctk.CTkScrollableFrame(self, fg_color=COLORS["surface"])
+        self.table = ScrollableTable(self, min_content_width=sum(self.COLUMN_WIDTHS))
         self.table.grid(row=3, column=0, sticky="nsew", padx=SPACING["xl"], pady=SPACING["sm"])
         pager = ctk.CTkFrame(self, fg_color="transparent")
         pager.grid(row=4, column=0, sticky="ew", padx=SPACING["xl"], pady=(SPACING["sm"], SPACING["lg"]))
@@ -313,14 +314,16 @@ class SearchSavedScreen(BaseScreen):
         self._query_controller.close()
 
     def _render_table(self) -> None:
-        for child in self.table.winfo_children():
+        content = self.table.content
+        for child in content.winfo_children():
             child.destroy()
         self.link_buttons = []
         for column_index, (field, label) in enumerate(self.COLUMNS):
+            content.grid_columnconfigure(column_index, minsize=self.COLUMN_WIDTHS[column_index])
             if field in {"reference", "council", "application_date", "address", "postcode", "description", "status"}:
-                heading = FocusButton(self.table, text=label, command=lambda value=field: self._sort(value), width=120)
+                heading = FocusButton(content, text=label, command=lambda value=field: self._sort(value), width=120)
             else:
-                heading = ctk.CTkLabel(self.table, text=label, font=TYPE["heading"])
+                heading = ctk.CTkLabel(content, text=label, font=TYPE["heading"])
             heading.grid(row=0, column=column_index, sticky="ew", padx=2, pady=2)
         if self.model.error_message:
             self.status_var.set(f"Error: {self.model.error_message}")
@@ -337,7 +340,7 @@ class SearchSavedScreen(BaseScreen):
                 if column_index in {7, 8}:
                     valid = is_openable_url(value)
                     button = FocusButton(
-                        self.table,
+                        content,
                         text="Open" if valid else "Unavailable",
                         state="normal" if valid else "disabled",
                         command=lambda url=value: open_url_if_safe(url, webbrowser.open),
@@ -346,7 +349,7 @@ class SearchSavedScreen(BaseScreen):
                     button.grid(row=row_index, column=column_index, padx=2, pady=2)
                     self.link_buttons.append(button)
                 else:
-                    ctk.CTkLabel(self.table, text=value, anchor="w", justify="left", wraplength=260).grid(
+                    ctk.CTkLabel(content, text=value, anchor="w", justify="left", wraplength=260).grid(
                         row=row_index, column=column_index, sticky="nw", padx=4, pady=3
                     )
         self.page_var.set(f"Page {self.model.page} of {self.model.total_pages} · {self.model.total_items} results")
@@ -406,6 +409,7 @@ class SendApplicationsScreen(BaseScreen):
 
 class IssuesScreen(BaseScreen):
     COLUMNS = ("Timestamp", "Run", "Council", "Portal Family", "Outcome", "Error / Exception")
+    COLUMN_WIDTHS = (180, 80, 180, 150, 130, 400)
 
     def __init__(self, master, service: IssueQueryService):
         super().__init__(master)
@@ -431,7 +435,7 @@ class IssuesScreen(BaseScreen):
         ctk.CTkLabel(self, textvariable=self.status_var, anchor="w").grid(
             row=2, column=0, sticky="ew", padx=SPACING["xl"], pady=SPACING["sm"]
         )
-        self.table = ctk.CTkScrollableFrame(self, fg_color=COLORS["surface"])
+        self.table = ScrollableTable(self, min_content_width=sum(self.COLUMN_WIDTHS))
         self.table.grid(row=3, column=0, sticky="nsew", padx=SPACING["xl"], pady=(0, SPACING["lg"])); self._render()
 
     def _load(self) -> None:
@@ -455,7 +459,9 @@ class IssuesScreen(BaseScreen):
     def _finish_query(self) -> None:
         self.load_button.configure(state="normal")
         if self._query_controller.last_error is not None:
-            self.status_var.set(str(self._query_controller.last_error))
+            error_message = str(self._query_controller.last_error)
+            self._render()
+            self.status_var.set(error_message)
             return
         self._render()
 
@@ -469,10 +475,12 @@ class IssuesScreen(BaseScreen):
         self._query_controller.close()
 
     def _render(self) -> None:
-        for child in self.table.winfo_children():
+        content = self.table.content
+        for child in content.winfo_children():
             child.destroy()
         for index, heading in enumerate(self.COLUMNS):
-            ctk.CTkLabel(self.table, text=heading, font=TYPE["heading"]).grid(row=0, column=index, padx=SPACING["sm"], pady=SPACING["sm"])
+            content.grid_columnconfigure(index, minsize=self.COLUMN_WIDTHS[index])
+            ctk.CTkLabel(content, text=heading, font=TYPE["heading"]).grid(row=0, column=index, padx=SPACING["sm"], pady=SPACING["sm"])
         if self.model.error_message:
             self.status_var.set(f"Error: {self.model.error_message}")
         elif not self.model.rows:
@@ -481,8 +489,9 @@ class IssuesScreen(BaseScreen):
             self.status_var.set(f"Loaded {len(self.model.rows)} issue(s)")
         for row_index, row in enumerate(self.model.rows, start=1):
             error = " — ".join(part for part in (row.error_type, row.message) if part)
-            values = (row.timestamp.isoformat(sep=" ", timespec="seconds"), str(row.run_id or ""), row.council, row.portal_family, row.outcome, error)
+            run_id = "" if row.run_id is None else str(row.run_id)
+            values = (row.timestamp.isoformat(sep=" ", timespec="seconds"), run_id, row.council, row.portal_family, row.outcome, error)
             for column_index, value in enumerate(values):
-                ctk.CTkLabel(self.table, text=value, anchor="w", justify="left", wraplength=300).grid(
+                ctk.CTkLabel(content, text=value, anchor="w", justify="left", wraplength=300).grid(
                     row=row_index, column=column_index, sticky="nw", padx=SPACING["sm"], pady=SPACING["xs"]
                 )

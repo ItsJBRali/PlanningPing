@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
-from planning_ping.contracts import AppServices, Page, SearchSummary
+from planning_ping.contracts import AppServices, IssueRow, Page, SearchSummary
 from planning_ping.ui import PlanningPingApp
 
 from .fakes import FakeApplicationQueryService, FakeIssueQueryService, FakeSearchService
@@ -20,7 +20,20 @@ class PlanningPingAppSmokeTests(unittest.TestCase):
         services = AppServices(
             search=FakeSearchService(SearchSummary(1, "completed", 0, 0, 0, 0, 0, now, now)),
             applications=FakeApplicationQueryService((Page((), 1, 50, 0),)),
-            issues=FakeIssueQueryService(()),
+            issues=FakeIssueQueryService(
+                (
+                    IssueRow(
+                        issue_id=1,
+                        run_id=0,
+                        timestamp=datetime(2026, 1, 2, 12, 30),
+                        council="Zero Council",
+                        portal_family="Idox",
+                        outcome="failed",
+                        error_type="Timeout",
+                        message="Portal timed out",
+                    ),
+                )
+            ),
         )
         try:
             cls.app = PlanningPingApp(services)
@@ -37,6 +50,24 @@ class PlanningPingAppSmokeTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.app.navigate("home")
+
+    def _drain_query(self, screen) -> None:
+        deadline = time.monotonic() + 2
+        while screen._query_controller.running and time.monotonic() < deadline:
+            self.app.update()
+            time.sleep(0.005)
+        self.assertFalse(screen._query_controller.running)
+
+    @staticmethod
+    def _table_texts(table) -> tuple[str, ...]:
+        content = getattr(table, "content", table)
+        texts: list[str] = []
+        for widget in content.winfo_children():
+            try:
+                texts.append(str(widget.cget("text")))
+            except (AttributeError, ValueError):
+                continue
+        return tuple(texts)
 
     def test_sidebar_routes_reuse_one_screen_instance_each(self) -> None:
         original_ids = {route: id(screen) for route, screen in self.app.screens.items()}
@@ -88,6 +119,43 @@ class PlanningPingAppSmokeTests(unittest.TestCase):
             time.sleep(0.005)
         self.assertFalse(saved._query_controller.running)
         self.assertFalse(issues._query_controller.running)
+
+    def test_issue_validation_error_clears_prior_rows_and_preserves_run_zero(self) -> None:
+        issues = self.app.screens["view_issues"]
+        issues.run_var.set("")
+        issues.outcome_var.set("All outcomes")
+        issues._load()
+        self._drain_query(issues)
+        successful_text = self._table_texts(issues.table)
+        self.assertIn("Zero Council", successful_text)
+        self.assertIn("0", successful_text)
+
+        issues.run_var.set("not-a-run")
+        issues._load()
+        self._drain_query(issues)
+        self.assertIn("whole number", issues.status_var.get())
+        self.assertNotIn("Zero Council", self._table_texts(issues.table))
+
+    def test_saved_and_issue_tables_scroll_horizontally_at_minimum_width(self) -> None:
+        self.app.geometry("1024x680")
+        self.app.deiconify()
+        self.app.update()
+        try:
+            for route in ("search_saved", "view_issues"):
+                self.app.navigate(route)
+                self.app.update_idletasks()
+                table = self.app.screens[route].table
+                self.assertTrue(hasattr(table, "horizontal_scrollbar"))
+                start_first, start_last = table.xview()
+                self.assertLess(start_last - start_first, 1.0)
+                table.xview_moveto(1.0)
+                self.app.update_idletasks()
+                end_first, end_last = table.xview()
+                self.assertGreater(end_first, start_first)
+                self.assertAlmostEqual(end_last, 1.0, places=4)
+        finally:
+            self.app.geometry("1280x800")
+            self.app.withdraw()
 
     def test_clear_filters_cannot_mutate_state_during_a_saved_query(self) -> None:
         saved = self.app.screens["search_saved"]
