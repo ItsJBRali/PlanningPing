@@ -62,8 +62,9 @@ class ServiceCompositionIntegrationTests(unittest.TestCase):
         self.assertTrue(hasattr(entrypoint, "main"), "the executable main function is missing")
         received: list[AppServices] = []
 
-        def record_ui_launch(services: AppServices) -> None:
+        def record_ui_launch(services: AppServices) -> bool:
             received.append(services)
+            return True
 
         with tempfile.TemporaryDirectory() as local_appdata:
             database_path = Path(local_appdata) / "PlanningPing" / "applications.sql"
@@ -77,6 +78,25 @@ class ServiceCompositionIntegrationTests(unittest.TestCase):
             self.assertTrue(database_path.is_file())
             database_path.unlink()
             self.assertFalse(database_path.exists())
+
+    def test_entrypoint_keeps_services_open_when_ui_reports_workers_undrained(self) -> None:
+        import planning_ping.__main__ as entrypoint
+
+        with tempfile.TemporaryDirectory() as directory:
+            services = create_services(Path(directory) / "undrained.sql")
+            try:
+                with patch.object(entrypoint, "create_services", lambda: services), patch.object(
+                    entrypoint, "run_app", lambda _services: False
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "workers"):
+                        entrypoint.main()
+
+                self.assertEqual(
+                    1,
+                    services.search._database.connection.execute("PRAGMA user_version").fetchone()[0],
+                )
+            finally:
+                entrypoint.close_services(services)
 
     def test_smoke_mode_constructs_real_services_and_ui_then_exits_cleanly(self) -> None:
         import planning_ping.__main__ as entrypoint

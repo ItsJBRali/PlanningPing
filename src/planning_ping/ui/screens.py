@@ -190,14 +190,14 @@ class SearchNewScreen(BaseScreen):
         self.warning_box.insert("1.0", "\n".join(state.warnings) or "No warnings")
         self.warning_box.configure(state="disabled")
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout_seconds: float = 0.0) -> bool:
         if self._poll_job is not None:
             try:
                 self.after_cancel(self._poll_job)
             except Exception:
                 pass
             self._poll_job = None
-        self._controller.close()
+        return self._controller.close(timeout_seconds)
 
 
 class SearchSavedScreen(BaseScreen):
@@ -304,14 +304,14 @@ class SearchSavedScreen(BaseScreen):
             return
         self._render_table()
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout_seconds: float = 0.0) -> bool:
         if self._query_job is not None:
             try:
                 self.after_cancel(self._query_job)
             except Exception:
                 pass
             self._query_job = None
-        self._query_controller.close()
+        return self._query_controller.close(timeout_seconds)
 
     def _render_table(self) -> None:
         content = self.table.content
@@ -469,14 +469,14 @@ class IssuesScreen(BaseScreen):
             return
         self._render()
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout_seconds: float = 0.0) -> bool:
         if self._query_job is not None:
             try:
                 self.after_cancel(self._query_job)
             except Exception:
                 pass
             self._query_job = None
-        self._query_controller.close()
+        return self._query_controller.close(timeout_seconds)
 
     def _render(self) -> None:
         content = self.table.content

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from queue import Empty, Queue
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, current_thread
 from typing import Callable
 
 from planning_ping.contracts import SearchEvent, SearchRequest, SearchService, SearchSummary
@@ -161,10 +161,31 @@ class SearchController:
             f"{summary.failed_councils} failed"
         )
 
-    def close(self) -> None:
-        self._closed = True
-        if self._cancel_event is not None:
-            self._cancel_event.set()
+    def close(self, timeout_seconds: float = 0.0) -> bool:
+        with self._lock:
+            self._closed = True
+            if self._cancel_event is not None:
+                self._cancel_event.set()
+            worker = self._worker
+        if worker is not None and worker is not current_thread():
+            worker.join(max(0.0, timeout_seconds))
+        drained = worker is None or not worker.is_alive()
+        if drained:
+            while True:
+                try:
+                    self._messages.get_nowait()
+                except Empty:
+                    break
+            with self._lock:
+                if self._worker is worker:
+                    self._worker = None
+            self.state = replace(
+                self.state,
+                running=False,
+                search_enabled=False,
+                cancel_enabled=False,
+            )
+        return drained
 
 
 class BackgroundTaskController:
@@ -174,6 +195,7 @@ class BackgroundTaskController:
         self._on_finished = on_finished
         self._messages: Queue[Exception | None] = Queue()
         self._closed = False
+        self._worker: Thread | None = None
         self.running = False
         self.last_error: Exception | None = None
 
@@ -193,7 +215,8 @@ class BackgroundTaskController:
             else:
                 self._messages.put(None)
 
-        Thread(target=work, name="PlanningPing query", daemon=True).start()
+        self._worker = Thread(target=work, name="PlanningPing query", daemon=True)
+        self._worker.start()
 
     def poll(self) -> bool:
         if not self.running:
@@ -203,9 +226,23 @@ class BackgroundTaskController:
         except Empty:
             return False
         self.running = False
+        self._worker = None
         if not self._closed:
             self._on_finished()
         return True
 
-    def close(self) -> None:
+    def close(self, timeout_seconds: float = 0.0) -> bool:
         self._closed = True
+        worker = self._worker
+        if worker is not None and worker is not current_thread():
+            worker.join(max(0.0, timeout_seconds))
+        drained = worker is None or not worker.is_alive()
+        if drained:
+            while True:
+                try:
+                    self.last_error = self._messages.get_nowait()
+                except Empty:
+                    break
+            self.running = False
+            self._worker = None
+        return drained

@@ -167,5 +167,5 @@ class BaseScreen(ctk.CTkFrame):
     def on_hide(self) -> None:
         pass
 
-    def shutdown(self) -> None:
-        pass
+    def shutdown(self, timeout_seconds: float = 0.0) -> bool:
+        return True

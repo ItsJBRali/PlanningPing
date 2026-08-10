@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from time import monotonic
+
 import customtkinter as ctk
 from tkinterdnd2 import TkinterDnD
 
@@ -15,6 +17,9 @@ from .theme import COLORS, SPACING, TYPE, configure_theme
 
 class PlanningPingApp(ctk.CTk):
     """Resizable Windows-first shell backed by injected application services."""
+
+    SHUTDOWN_JOIN_BUDGET_SECONDS = 0.25
+    SHUTDOWN_RETRY_MILLISECONDS = 25
 
     TITLES = {
         "home": "Home",
@@ -33,7 +38,8 @@ class PlanningPingApp(ctk.CTk):
         self.minsize(1024, 680)
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(1, weight=1)
-        self._destroying = False
+        self._destroyed = False
+        self.workers_drained = False
         sidebar = ctk.CTkFrame(self, width=245, corner_radius=0, fg_color=COLORS["surface"])
         sidebar.grid(row=0, column=0, rowspan=2, sticky="nsew")
         sidebar.grid_propagate(False)
@@ -92,14 +98,25 @@ class PlanningPingApp(ctk.CTk):
         self.top_title_var.set(self.TITLES[route])
 
     def destroy(self) -> None:
-        if self._destroying:
+        if self._destroyed:
             return
-        self._destroying = True
+        deadline = monotonic() + self.SHUTDOWN_JOIN_BUDGET_SECONDS
+        drained = True
         for screen in self.screens.values():
-            screen.shutdown()
+            remaining = max(0.0, deadline - monotonic())
+            if not screen.shutdown(remaining):
+                drained = False
+        if not drained:
+            self.after(self.SHUTDOWN_RETRY_MILLISECONDS, self.destroy)
+            return
+        self.workers_drained = True
+        self._destroyed = True
+        for callback_id in self.tk.splitlist(self.tk.call("after", "info")):
+            self.tk.call("after", "cancel", callback_id)
         super().destroy()
 
 
-def run_app(services: AppServices) -> None:
+def run_app(services: AppServices) -> bool:
     app = PlanningPingApp(services)
     app.mainloop()
+    return app.workers_drained

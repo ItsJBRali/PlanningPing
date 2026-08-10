@@ -16,7 +16,7 @@ def close_services(services: AppServices) -> None:
     search_service._database.close()
 
 
-def _run_smoke(services: AppServices) -> None:
+def _run_smoke(services: AppServices) -> bool:
     app = PlanningPingApp(services)
 
     def stop_after_startup() -> None:
@@ -32,19 +32,24 @@ def _run_smoke(services: AppServices) -> None:
         for callback_id in app.tk.splitlist(app.tk.call("after", "info")):
             app.tk.call("after", "cancel", callback_id)
         app.destroy()
+    return app.workers_drained
 
 
 def main() -> int:
     """Construct the production services and run the desktop application."""
 
     services = create_services()
+    workers_drained = False
     try:
         if os.environ.get("PLANNINGPING_SMOKE_TEST") == "1":
-            _run_smoke(services)
+            workers_drained = _run_smoke(services)
         else:
-            run_app(services)
+            workers_drained = run_app(services)
+        if not workers_drained:
+            raise RuntimeError("UI shutdown did not drain all workers; services remain open")
     finally:
-        close_services(services)
+        if workers_drained:
+            close_services(services)
     return 0
 
 
