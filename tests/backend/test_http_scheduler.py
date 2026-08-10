@@ -435,6 +435,7 @@ class HttpBoundaryTests(unittest.TestCase):
             driver = CouncilBrowserClient()._create_driver()
 
         self.assertFalse(driver.cdp_commands)
+        self.assertNotIn("--no-sandbox", driver.options.arguments)
         self.assertFalse(any("AutomationControlled" in item for item in driver.options.arguments))
         self.assertNotIn(("excludeSwitches", ["enable-automation"]), driver.options.experimental)
 

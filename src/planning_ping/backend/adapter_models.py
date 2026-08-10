@@ -43,6 +43,7 @@ class PlanningApplication:
     postcode: str | None = None
     source_url: str | None = None
     documents: list[PlanningDocument] = field(default_factory=list)
+    documents_complete: bool = False
     date_scraped: str = field(default_factory=utc_now_iso)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -66,6 +67,7 @@ class PlanningApplication:
             "postcode": self.postcode,
             "source_url": self.source_url,
             "documents": [document.to_dict() for document in self.documents],
+            "documents_complete": self.documents_complete,
             "date_scraped": self.date_scraped,
             "raw": self.raw,
         }

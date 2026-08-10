@@ -109,6 +109,7 @@ class IdoxPublicAccessScraper(PlanningScraper):
         application = self.parse_detail(response.text, response.url, fallback_uid=uid)
         if include_documents:
             application.documents = self.fetch_documents(uid)
+            application.documents_complete = True
         return application
 
     def build_weekly_list_url(self, *, start_date: date | None = None, end_date: date | None = None) -> str:

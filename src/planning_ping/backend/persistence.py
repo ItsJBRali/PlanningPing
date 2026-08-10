@@ -362,14 +362,15 @@ class PlanningDatabase:
         assert row is not None
         application_id = int(row[0])
         urls = [document.document_url for document in application.documents]
-        if urls:
-            placeholders = ",".join("?" for _ in urls)
-            connection.execute(
-                f"DELETE FROM application_documents WHERE application_id=? AND document_url NOT IN ({placeholders})",
-                (application_id, *urls),
-            )
-        else:
-            connection.execute("DELETE FROM application_documents WHERE application_id=?", (application_id,))
+        if application.documents_complete:
+            if urls:
+                placeholders = ",".join("?" for _ in urls)
+                connection.execute(
+                    f"DELETE FROM application_documents WHERE application_id=? AND document_url NOT IN ({placeholders})",
+                    (application_id, *urls),
+                )
+            else:
+                connection.execute("DELETE FROM application_documents WHERE application_id=?", (application_id,))
         for document in application.documents:
             connection.execute(
                 """INSERT INTO application_documents(

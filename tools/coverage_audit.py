@@ -50,10 +50,15 @@ def live_smoke(report: AuditReport, *, timeout_seconds: float, limit: int) -> Au
 
     client = CouncilHttpClient(timeout_seconds=timeout_seconds, min_delay_seconds=0.25, retries=0)
     updated = []
-    for index, row in enumerate(report.rows):
-        if index >= limit or row.result != "pass":
+    contacted = 0
+    for row in report.rows:
+        if row.result != "pass":
             updated.append(row)
             continue
+        if contacted >= limit:
+            updated.append(replace(row, result="not_checked", error="live reachability not checked (bounded limit)"))
+            continue
+        contacted += 1
         try:
             response = client.get(row.endpoint)
             updated.append(replace(row, result="pass", error=None))

@@ -101,6 +101,7 @@ class AchieveFormsPlanningScraper(PlanningScraper):
         application = self._fetch_application_with_metadata(uid, metadata)
         if include_documents:
             application.documents = self._fetch_documents(uid, metadata)
+            application.documents_complete = True
         return application
 
     def _metadata(self, listing_url: str) -> AchieveFormsMetadata:

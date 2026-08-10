@@ -116,6 +116,8 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(3, kinds.count("council_finished"))
         self.assertEqual(3, kinds.count("application_saved"))
         self.assertEqual(2, kinds.count("warning"))
+        progress = [event.completed for event in events if event.completed is not None]
+        self.assertEqual(sorted(progress), progress)
 
     def test_no_intersection_is_a_successful_zero_council_run(self) -> None:
         far = {"type": "Polygon", "coordinates": [[[10, 10], [11, 10], [11, 11], [10, 11], [10, 10]]]}

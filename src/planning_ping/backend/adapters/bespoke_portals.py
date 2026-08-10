@@ -341,7 +341,34 @@ class TelfordPlanningScraper(NativeListingScraper):
                     },
                 )
             )
+        reported_total = self._reported_result_total(result_document)
+        has_pagination = bool(
+            result_document.xpath(
+                "//a[contains(translate(@href,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'page') "
+                "or contains(translate(normalize-space(string(.)),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'next')]"
+            )
+        )
+        if reported_total is not None and reported_total > len(applications):
+            raise PortalSearchCompletenessError(
+                f"Telford returned {len(applications)} rows below its reported total of {reported_total}"
+            )
+        if has_pagination or (len(applications) >= 10 and reported_total is None):
+            raise PortalSearchCompletenessError(
+                "Telford reached its ten-row daily result cap without proving the result set complete"
+            )
         return applications
+
+    @staticmethod
+    def _reported_result_total(document: html.HtmlElement) -> int | None:
+        text = clean_text(" ".join(document.itertext())) or ""
+        for pattern in (
+            r"\b(?:displaying|showing|results?)\s+\d+\s*(?:-|to)\s*\d+\s+of\s+(\d+)\b",
+            r"\btotal(?:\s+results?)?\s*[:=]?\s*(\d+)\b",
+        ):
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+        return None
 
 
 class WestDunbartonshirePlanningScraper(NativeListingScraper):

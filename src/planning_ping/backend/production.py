@@ -190,10 +190,13 @@ class ProductionAuthoritySearcher:
                     if scraper.discovery_is_detail_complete(discovered):
                         complete = discovered
                     else:
-                        complete = scraper.fetch_application(
-                            discovered.uid,
-                            discovered.url,
-                            include_documents=True,
+                        complete = _merge_discovery_details(
+                            discovered,
+                            scraper.fetch_application(
+                                discovered.uid,
+                                discovered.url,
+                                include_documents=True,
+                            ),
                         )
                     application = _from_adapter(council, complete)
                     if (
@@ -300,8 +303,8 @@ def _from_adapter(council: Council, source: AdapterApplication) -> PlanningAppli
         case_officer=source.case_officer,
         ward=source.ward,
         parish=source.parish,
-        longitude=_float_value(_first_present(raw.get("longitude"), raw.get("location_x"))),
-        latitude=_float_value(_first_present(raw.get("latitude"), raw.get("location_y"))),
+        longitude=_float_value(_adapter_coordinate(raw, "longitude", "location_x")),
+        latitude=_float_value(_adapter_coordinate(raw, "latitude", "location_y")),
         scraped_at=_parse_datetime(source.date_scraped),
         raw=raw,
         documents=tuple(
@@ -316,7 +319,45 @@ def _from_adapter(council: Council, source: AdapterApplication) -> PlanningAppli
             )
             for document in source.documents
         ),
+        documents_complete=source.documents_complete,
     )
+
+
+def _merge_discovery_details(discovery: AdapterApplication, details: AdapterApplication) -> AdapterApplication:
+    for name in (
+        "authority", "uid", "url", "reference", "address", "description", "status", "decision",
+        "date_received", "date_validated", "applicant_name", "agent_name", "case_officer", "ward",
+        "parish", "postcode", "source_url",
+    ):
+        detail_value = getattr(details, name)
+        if detail_value is None or isinstance(detail_value, str) and not detail_value.strip():
+            setattr(details, name, getattr(discovery, name))
+    details.raw = _merge_raw(discovery.raw, details.raw)
+    if not details.documents:
+        details.documents = list(discovery.documents)
+        details.documents_complete = discovery.documents_complete
+    return details
+
+
+def _merge_raw(discovery: dict[str, object], details: dict[str, object]) -> dict[str, object]:
+    merged = dict(discovery)
+    for key, value in details.items():
+        existing = merged.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merged[key] = _merge_raw(existing, value)
+        elif value not in (None, ""):
+            merged[key] = value
+    return merged
+
+
+def _adapter_coordinate(raw: dict[str, object], primary: str, alternate: str) -> object:
+    direct = _first_present(raw.get(primary), raw.get(alternate))
+    if direct is not None:
+        return direct
+    record = raw.get("record")
+    if isinstance(record, dict):
+        return _first_present(record.get(primary), record.get(alternate))
+    return None
 
 
 def _from_planit(council: Council, record: dict[str, object], reference: str) -> PlanningApplication:

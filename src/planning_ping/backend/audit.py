@@ -36,7 +36,11 @@ class AuditReport:
 
     @property
     def ok(self) -> bool:
-        return all(row.result == "pass" for row in self.rows)
+        return all(row.result in {"pass", "not_checked"} for row in self.rows)
+
+    @property
+    def result_counts(self) -> Counter[str]:
+        return Counter(row.result for row in self.rows)
 
     def to_json(self) -> str:
         return json.dumps([row.to_dict() for row in self.rows], indent=2, sort_keys=True)

@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import json
-import http.client
-import ssl
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from typing import Any
-from urllib.parse import quote, urlencode, urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
 from lxml import html
@@ -128,6 +126,7 @@ class AgilePlanningScraper(GenericLabelledPlanningScraper):
         application.raw = {**application.raw, "detail_complete": True}
         if include_documents:
             application.documents = self.fetch_documents(uid, client_code=client_code)
+            application.documents_complete = True
         return application
 
     def fetch_documents(self, uid: str, *, client_code: str | None = None) -> list[PlanningDocument]:
@@ -316,39 +315,19 @@ class AgilePlanningScraper(GenericLabelledPlanningScraper):
         )
 
     def _api_get(self, path: str, params: dict[str, str], client_code: str) -> tuple[str, str]:
-        if not isinstance(self.http, CouncilHttpClient):
-            response = self.http.get(f"{self.API_URL}{path.lstrip('/')}", params=params, headers=self._api_headers(client_code))
+        if not hasattr(self.http, "get_bytes"):
+            response = self.http.get(
+                f"{self.API_URL}{path.lstrip('/')}",
+                params=params,
+                headers=self._api_headers(client_code),
+            )
             return response.text, response.url
-
-        base = urlsplit(self.API_URL)
-        query = urlencode(params, safe=":")
-        request_path = f"{base.path.rstrip('/')}/{path.lstrip('/')}"
-        if query:
-            request_path = f"{request_path}?{query}"
-        response_url = f"{base.scheme}://{base.netloc}{request_path}"
-
-        connection = http.client.HTTPSConnection(
-            base.netloc,
-            timeout=self.http.timeout_seconds,
-            context=self.http._ssl_context(),
+        response = self.http.get_bytes(
+            f"{self.API_URL}{path.lstrip('/')}",
+            params=params,
+            headers=self._api_headers(client_code),
         )
-        try:
-            connection.putrequest("GET", request_path, skip_accept_encoding=True)
-            for key, value in self._api_headers(client_code).items():
-                connection.putheader(key, value)
-            connection.endheaders()
-            response = connection.getresponse()
-            body = response.read()
-            text = body.decode(response.headers.get_content_charset() or "utf-8", errors="replace")
-            if response.status >= 400:
-                raise CouncilFetchError(f"HTTP {response.status} while fetching {response_url}")
-            return text, response_url
-        except ssl.SSLCertVerificationError as exc:
-            raise CouncilFetchError(
-                f"TLS certificate verification failed while fetching {response_url}: {exc}"
-            ) from exc
-        finally:
-            connection.close()
+        return response.body.decode("utf-8", errors="replace"), response.url
 
     def _application_from_record(
         self,

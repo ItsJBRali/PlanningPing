@@ -61,6 +61,7 @@ class PlanningApplication:
     scraped_at: datetime = field(default_factory=utc_now)
     raw: dict[str, Any] = field(default_factory=dict)
     documents: tuple[ApplicationDocument, ...] = ()
+    documents_complete: bool = False
 
     @property
     def application_date(self) -> date | None:
