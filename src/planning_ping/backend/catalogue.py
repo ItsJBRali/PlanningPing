@@ -12,6 +12,17 @@ from .geometry import geometries_intersect, validate_geojson
 from .models import Council
 
 
+_CURRENT_PORTAL_OVERRIDES: dict[str, dict[str, str]] = {
+    "E07000219": {
+        "portal_family": "tascomi",
+        "scraper_type": "Tascomi",
+        "base_url": "https://idoxcloud.nuneatonandbedworth.gov.uk",
+        "listing_url": "https://idoxcloud.nuneatonandbedworth.gov.uk/planning/index.html?fa=search",
+        "planning_url": "https://idoxcloud.nuneatonandbedworth.gov.uk/planning/index.html?fa=search",
+    },
+}
+
+
 def stable_council_code(properties: dict[str, Any]) -> str:
     official = str(properties.get("gss_code") or "").strip()
     if official:
@@ -53,7 +64,8 @@ class AuthorityCatalogue:
         for feature in payload["features"]:
             if not isinstance(feature, dict) or not isinstance(feature.get("properties"), dict):
                 raise ValueError("Authority catalogue features require properties")
-            properties = feature["properties"]
+            properties = dict(feature["properties"])
+            properties.update(_CURRENT_PORTAL_OVERRIDES.get(str(properties.get("gss_code") or ""), {}))
             geometry = feature.get("geometry")
             if not isinstance(geometry, dict):
                 raise ValueError("Authority catalogue features require boundaries")
