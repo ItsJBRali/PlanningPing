@@ -7,7 +7,7 @@ from datetime import date, timedelta
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit, urlunsplit
 
-from planning_ping.backend.adapters.base import PlanningScraper
+from planning_ping.backend.adapters.base import PlanningScraper, PortalSearchCompletenessError
 from planning_ping.backend.http import CouncilFetchError, CouncilHttpClient
 from planning_ping.backend.adapter_models import DiscoveryResult, PlanningApplication
 from planning_ping.backend.parsing import clean_text, extract_postcode, parse_council_date
@@ -32,7 +32,6 @@ class ArcusPlanningScraper(PlanningScraper):
         super().__init__(config.authority)
         self.config = config
         self.http = http_client or CouncilHttpClient(
-            verify_tls=False,
             min_delay_seconds=1.25,
             retries=5,
             concurrency_key="portal:arcus",
@@ -69,6 +68,12 @@ class ArcusPlanningScraper(PlanningScraper):
     ) -> PlanningApplication:
         raise ValueError("Arcus search results are complete enough for lead matching")
 
+    def discovery_is_detail_complete(self, application: PlanningApplication) -> bool:
+        return (
+            application.raw.get("detail_complete") is True
+            and application.raw.get("date_range_filtered") is True
+        )
+
     def _search_records(
         self,
         listing_url: str,
@@ -98,8 +103,12 @@ class ArcusPlanningScraper(PlanningScraper):
             start_date=start_date,
             end_date=end_date,
         )
-        if not (threshold_hit and start_date and end_date and start_date < end_date):
+        if not threshold_hit:
             return records
+        if not (start_date and end_date and start_date < end_date):
+            raise PortalSearchCompletenessError(
+                "Arcus hit its result threshold for a date window that cannot be split further"
+            )
 
         midpoint = start_date + timedelta(days=(end_date - start_date).days // 2)
         next_start = midpoint + timedelta(days=1)
@@ -115,12 +124,8 @@ class ArcusPlanningScraper(PlanningScraper):
             start_date=next_start,
             end_date=end_date,
         )
-        merged_split_records = self._dedupe_records([*left_records, *right_records])
-        if len(merged_split_records) <= len(self._dedupe_records(records)):
-            return records
-
         expanded_records: list[dict[str, Any]] = []
-        if left_threshold and start_date < midpoint:
+        if left_threshold:
             expanded_records.extend(
                 self._search_records_window(
                     listing_url,
@@ -131,7 +136,7 @@ class ArcusPlanningScraper(PlanningScraper):
             )
         else:
             expanded_records.extend(left_records)
-        if right_threshold and next_start < end_date:
+        if right_threshold:
             expanded_records.extend(
                 self._search_records_window(
                     listing_url,

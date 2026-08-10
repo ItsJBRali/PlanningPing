@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, unquote, urljoin, urlsplit
 from lxml import html
 
 from planning_ping.backend.adapters.generic import GenericCouncilConfig, GenericLabelledPlanningScraper
+from planning_ping.backend.adapters.base import PortalSearchCompletenessError
 from planning_ping.backend.http import CouncilHttpClient, FetchResponse
 from planning_ping.backend.adapter_models import DiscoveryResult, PlanningApplication
 from planning_ping.backend.parsing import clean_text, extract_postcode, parse_council_date
@@ -35,6 +36,8 @@ class AtriumCouncilConfig(GenericCouncilConfig):
 
 class AtriumPlanningScraper(GenericLabelledPlanningScraper):
     """Scraper for DEF/Atrium planning-register search pages."""
+
+    MAX_PAGED_RESULT_PAGES = 100
 
     def __init__(
         self,
@@ -84,18 +87,51 @@ class AtriumPlanningScraper(GenericLabelledPlanningScraper):
             response = self._submit_date_search(response, start_date=start_date, end_date=end_date)
         response = self._expand_results_per_page(response)
         pages = [response.text]
-        seen = {response.url}
+        seen_urls = {response.url}
+        queued_urls = self._pagination_urls(response.text, response.url)
+        first_applications = self.parse_listing(response.text, response.url)
+        seen_ids = {application.uid for application in first_applications}
+        seen_signatures: set[tuple[str, ...]] = set()
+        first_signature = tuple(application.uid for application in first_applications)
+        if first_signature:
+            seen_signatures.add(first_signature)
         status_code = response.status_code
         final_url = response.url
+        processed_pages = 1
 
-        for page_url in self._pagination_urls(response.text, response.url)[:100]:
-            if page_url in seen:
+        while queued_urls:
+            page_url = queued_urls.pop(0)
+            if page_url in seen_urls:
                 continue
-            seen.add(page_url)
+            if processed_pages >= self.MAX_PAGED_RESULT_PAGES:
+                raise PortalSearchCompletenessError("Atrium exceeded the maximum page request cap")
+            seen_urls.add(page_url)
             page = self.http.get(page_url)
+            processed_pages += 1
+            page_applications = self.parse_listing(page.text, page.url)
+            signature = tuple(application.uid for application in page_applications)
+            if signature and signature in seen_signatures:
+                raise PortalSearchCompletenessError("Atrium returned a repeated result page")
+            if signature:
+                seen_signatures.add(signature)
+            new_ids = {application.uid for application in page_applications} - seen_ids
+            discovered_urls = self._pagination_urls(page.text, page.url)
+            unseen_discovered_urls = [
+                url for url in discovered_urls if url not in seen_urls and url not in queued_urls
+            ]
+            if not new_ids and unseen_discovered_urls:
+                raise PortalSearchCompletenessError("Atrium pagination made no unique-result progress")
+            seen_ids.update(new_ids)
+            queued_urls.extend(unseen_discovered_urls)
             pages.append(page.text)
             status_code = page.status_code
             final_url = page.url
+
+        expected_total = self._reported_result_total(pages)
+        if expected_total is not None and len(seen_ids) != expected_total:
+            raise PortalSearchCompletenessError(
+                f"Atrium returned {len(seen_ids)} results below its reported total of {expected_total}"
+            )
 
         if len(pages) == 1:
             return response
@@ -104,6 +140,14 @@ class AtriumPlanningScraper(GenericLabelledPlanningScraper):
             status_code=status_code,
             text="<html><body>" + "\n".join(pages) + "</body></html>",
         )
+
+    def _reported_result_total(self, pages: list[str]) -> int | None:
+        totals: set[int] = set()
+        for page in pages:
+            totals.update(int(value) for value in re.findall(r"\bPlanning\s*\((\d+)\)", page, re.IGNORECASE))
+        if len(totals) > 1:
+            raise PortalSearchCompletenessError("Atrium changed its reported total during pagination")
+        return next(iter(totals)) if totals else None
 
     def _expand_results_per_page(self, response: FetchResponse) -> FetchResponse:
         document = html.fromstring(response.text)

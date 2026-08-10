@@ -11,6 +11,7 @@ from planning_ping.backend.adapters.generic import (
     GenericCouncilConfig,
     GenericLabelledPlanningScraper,
 )
+from planning_ping.backend.adapters.base import PortalSearchCompletenessError
 from planning_ping.backend.http import (
     CouncilBrowserClient,
     CouncilFetchError,
@@ -52,6 +53,8 @@ class NorthgateCouncilConfig(GenericCouncilConfig):
 
 class NorthgatePlanningScraper(GenericLabelledPlanningScraper):
     """Scraper for Northgate Planning Explorer pages."""
+
+    MAX_PAGED_RESULT_PAGES = 500
 
     def discover_ids(
         self,
@@ -100,15 +103,34 @@ class NorthgatePlanningScraper(GenericLabelledPlanningScraper):
         pending = [first_page]
         queued_urls = {self._canonical_url(first_page.url)}
         seen_uids: set[str] = set()
+        seen_page_signatures: set[tuple[str, ...]] = set()
         applications: list[PlanningApplication] = []
+        processed_pages = 0
 
-        while pending and len(queued_urls) <= 500:
+        while pending:
+            if processed_pages >= self.MAX_PAGED_RESULT_PAGES:
+                raise PortalSearchCompletenessError("Northgate exceeded the maximum page request cap")
             page = pending.pop(0)
-            for application in self.parse_listing(page.text, page.url):
+            processed_pages += 1
+            page_total = self._result_total(page.text)
+            if page_total is not None:
+                if result_total is None:
+                    result_total = page_total
+                elif page_total != result_total:
+                    raise PortalSearchCompletenessError("Northgate changed its advertised total during pagination")
+            page_applications = self.parse_listing(page.text, page.url)
+            signature = tuple(application.uid for application in page_applications)
+            if signature and signature in seen_page_signatures:
+                raise PortalSearchCompletenessError("Northgate returned a repeated result page")
+            if signature:
+                seen_page_signatures.add(signature)
+            added = 0
+            for application in page_applications:
                 if application.uid in seen_uids:
                     continue
                 seen_uids.add(application.uid)
                 applications.append(application)
+                added += 1
                 if limit is not None and len(applications) >= limit:
                     return DiscoveryResult(
                         authority=self.authority,
@@ -122,12 +144,25 @@ class NorthgatePlanningScraper(GenericLabelledPlanningScraper):
             if result_total is not None and len(applications) >= result_total:
                 break
 
-            for page_url in self._pagination_urls(page.text, page.url):
+            discovered_urls = self._pagination_urls(page.text, page.url)
+            unseen_urls = [
+                page_url
+                for page_url in discovered_urls
+                if self._canonical_url(page_url) not in queued_urls
+            ]
+            if added == 0 and unseen_urls:
+                raise PortalSearchCompletenessError("Northgate pagination made no unique-result progress")
+            for page_url in unseen_urls:
                 canonical_url = self._canonical_url(page_url)
-                if canonical_url in queued_urls:
-                    continue
+                if len(queued_urls) >= self.MAX_PAGED_RESULT_PAGES:
+                    raise PortalSearchCompletenessError("Northgate exceeded the maximum page request cap")
                 queued_urls.add(canonical_url)
                 pending.append(self.http.get(page_url, headers={"Referer": page.url}))
+
+        if result_total is not None and len(applications) != result_total:
+            raise PortalSearchCompletenessError(
+                f"Northgate returned {len(applications)} results below its advertised total of {result_total}"
+            )
 
         return DiscoveryResult(
             authority=self.authority,

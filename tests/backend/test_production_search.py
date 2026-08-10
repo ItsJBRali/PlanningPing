@@ -10,8 +10,12 @@ from threading import Event
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from planning_ping.backend.adapter_models import DiscoveryResult, PlanningApplication as AdapterApplication, PlanningDocument
+from planning_ping.backend.adapters.base import PortalSearchCompletenessError
+from planning_ping.backend.adapters.arcus import ArcusCouncilConfig, ArcusPlanningScraper
 from planning_ping.backend.adapters.idox import IdoxPublicAccessScraper
+from planning_ping.backend.adapters.wiltshire import WiltshireCouncilConfig, WiltshirePlanningScraper
 from planning_ping.backend.http import FetchResponse
+from planning_ping.backend.geometry import location_match_quality
 from planning_ping.backend.models import Council
 from planning_ping.backend.production import ProductionAuthoritySearcher, UnsupportedPortalError, scraper_for_council
 
@@ -56,8 +60,56 @@ class FakeScraper:
             raw={"longitude": 1.0, "latitude": 1.0},
         )
 
+    def discovery_is_detail_complete(self, application: AdapterApplication) -> bool:
+        return False
+
     def close(self) -> None:
         pass
+
+
+class DetailCompleteDiscoveryScraper(FakeScraper):
+    def discover_ids(self, **kwargs: object) -> DiscoveryResult:
+        return DiscoveryResult(
+            authority="Alpha",
+            source_url="https://alpha.test/search",
+            applications=[
+                AdapterApplication(
+                    "Alpha",
+                    "UID1",
+                    "https://alpha.test/UID1",
+                    reference="24/A",
+                    address="Greenwich Meridian EX1 1AA",
+                    description="Rear extension",
+                    date_received="2026-01-05",
+                    documents=[
+                        PlanningDocument(
+                            "Plan",
+                            "https://alpha.test/document/1",
+                            "Drawing",
+                            "2026-01-06",
+                            "10 KB",
+                        )
+                    ],
+                    raw={
+                        "detail_complete": True,
+                        "date_range_filtered": True,
+                        "longitude": 0.0,
+                        "latitude": 0.0,
+                        "location_x": 9.0,
+                        "location_y": 9.0,
+                    },
+                )
+            ],
+        )
+
+    def fetch_application(self, uid: str, url: str | None = None, *, include_documents: bool = False) -> AdapterApplication:
+        raise AssertionError("detail-complete discovery must not fetch an unavailable detail endpoint")
+
+    def discovery_is_detail_complete(self, application: AdapterApplication) -> bool:
+        return (
+            application.raw.get("detail_complete") is True
+            and application.raw.get("date_range_filtered") is True
+        )
 
 
 class FakePlanItHttp:
@@ -89,6 +141,71 @@ class ProductionAuthoritySearchTests(unittest.TestCase):
         self.assertEqual(date(2026, 1, 5), application.received_date)
         self.assertEqual("https://alpha.test/document/1", application.documents[0].document_url)
         self.assertEqual(1.0, application.longitude)
+
+    def test_primary_search_accepts_explicitly_detail_complete_discovery_records(self) -> None:
+        searcher = ProductionAuthoritySearcher(scraper_factory=lambda _: DetailCompleteDiscoveryScraper())
+
+        result = searcher.search_primary(council(), date(2026, 1, 1), date(2026, 1, 31), Event())
+
+        application = result.applications[0]
+        self.assertEqual("24/A", application.reference)
+        self.assertEqual(date(2026, 1, 5), application.received_date)
+        self.assertEqual("https://alpha.test/document/1", application.documents[0].document_url)
+        self.assertEqual((0.0, 0.0), (application.longitude, application.latitude))
+        self.assertEqual("exact", location_match_quality(application.longitude, application.latitude, [BOUNDARY]))
+
+    def test_arcus_and_wiltshire_nonempty_discovery_do_not_call_unavailable_detail_endpoints(self) -> None:
+        discovered = AdapterApplication(
+            "Alpha",
+            "UID1",
+            "https://alpha.test/UID1",
+            reference="24/A",
+            description="Rear extension",
+            address="1 High Street EX1 1AA",
+            date_received="2026-01-05",
+            raw={"detail_complete": True, "date_range_filtered": True},
+        )
+
+        class NonemptyArcus(ArcusPlanningScraper):
+            def discover_ids(self, **kwargs: object) -> DiscoveryResult:
+                return DiscoveryResult("Alpha", "https://alpha.test/search", [discovered])
+
+        class NonemptyWiltshire(WiltshirePlanningScraper):
+            def discover_ids(self, **kwargs: object) -> DiscoveryResult:
+                return DiscoveryResult("Alpha", "https://alpha.test/search", [discovered])
+
+        scrapers = (
+            NonemptyArcus(ArcusCouncilConfig("Alpha", "https://alpha.test")),
+            NonemptyWiltshire(WiltshireCouncilConfig("Alpha", "https://alpha.test")),
+        )
+        for scraper in scrapers:
+            with self.subTest(scraper=type(scraper).__name__):
+                result = ProductionAuthoritySearcher(scraper_factory=lambda _, value=scraper: value).search_primary(
+                    council(), date(2026, 1, 1), date(2026, 1, 31), Event()
+                )
+                self.assertEqual(["24/A"], [application.reference for application in result.applications])
+
+    def test_primary_search_does_not_silently_use_incomplete_discovery_after_detail_failure(self) -> None:
+        class BrokenDetailScraper(FakeScraper):
+            def fetch_application(self, uid: str, url: str | None = None, *, include_documents: bool = False) -> AdapterApplication:
+                raise ValueError("detail retrieval failed")
+
+        with self.assertRaisesRegex(ValueError, "detail retrieval failed"):
+            ProductionAuthoritySearcher(scraper_factory=lambda _: BrokenDetailScraper()).search_primary(
+                council(), date(2026, 1, 1), date(2026, 1, 31), Event()
+            )
+
+    def test_primary_search_rejects_details_outside_requested_date_range(self) -> None:
+        class IgnoredDateRangeScraper(FakeScraper):
+            def fetch_application(self, uid: str, url: str | None = None, *, include_documents: bool = False) -> AdapterApplication:
+                application = super().fetch_application(uid, url, include_documents=include_documents)
+                application.date_received = "2025-12-31"
+                return application
+
+        with self.assertRaisesRegex(PortalSearchCompletenessError, "ignored"):
+            ProductionAuthoritySearcher(scraper_factory=lambda _: IgnoredDateRangeScraper()).search_primary(
+                council(), date(2026, 1, 1), date(2026, 1, 31), Event()
+            )
 
     def test_planit_rejects_repeated_pages_and_reported_total_mismatches(self) -> None:
         repeated = {"total": 2, "records": [{"uid": "24/A", "name": "24/A", "start_date": "2026-01-05"}]}

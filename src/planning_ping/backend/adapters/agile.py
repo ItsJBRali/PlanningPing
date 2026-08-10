@@ -15,6 +15,7 @@ from planning_ping.backend.adapters.generic import (
     GenericCouncilConfig,
     GenericLabelledPlanningScraper,
 )
+from planning_ping.backend.adapters.base import PortalSearchCompletenessError
 from planning_ping.backend.http import CouncilFetchError, CouncilHttpClient, FetchResponse
 from planning_ping.backend.adapter_models import DiscoveryResult, PlanningApplication, PlanningDocument
 from planning_ping.backend.parsing import clean_text, extract_postcode, parse_council_date
@@ -51,6 +52,7 @@ class AgilePlanningScraper(GenericLabelledPlanningScraper):
     API_URL = "https://planningapi.agileapplications.co.uk//api/"
     PORTAL_URL = "https://planning.agileapplications.co.uk/"
     UK_TZ = ZoneInfo("Europe/London")
+    MAX_PAGED_RESULT_PAGES = 50
 
     def __init__(
         self,
@@ -86,6 +88,13 @@ class AgilePlanningScraper(GenericLabelledPlanningScraper):
         records = payload.get("results") if isinstance(payload, dict) else payload
         if not isinstance(records, list):
             records = []
+        if isinstance(payload, dict):
+            advertised_total = payload.get("total", payload.get("totalCount"))
+            if isinstance(advertised_total, int) and not isinstance(advertised_total, bool):
+                if advertised_total != len(records):
+                    raise PortalSearchCompletenessError(
+                        f"Agile returned {len(records)} results below its advertised total of {advertised_total}"
+                    )
 
         applications = [
             self._application_from_record(record, listing_url, slug, client_code)
@@ -245,25 +254,56 @@ class AgilePlanningScraper(GenericLabelledPlanningScraper):
         return super()._extract_reference(anchor, row_text)
 
     def _with_legacy_apas_pages(self, response: FetchResponse) -> FetchResponse:
-        document = html.fromstring(response.text)
-        page_urls: list[str] = []
-        seen = {response.url}
-        for anchor in document.xpath("//a[@href]"):
-            href = anchor.get("href") or ""
-            lowered = href.casefold()
-            if "wphappsearchres.displayresultsurl" not in lowered or "startindex=" not in lowered:
-                continue
-            page_url = urljoin(response.url, href)
-            if page_url in seen:
-                continue
-            seen.add(page_url)
-            page_urls.append(page_url)
+        def pagination_urls(html_text: str, page_url: str) -> list[str]:
+            document = html.fromstring(html_text)
+            urls: list[str] = []
+            for anchor in document.xpath("//a[@href]"):
+                href = anchor.get("href") or ""
+                lowered = href.casefold()
+                if "wphappsearchres.displayresultsurl" not in lowered or "startindex=" not in lowered:
+                    continue
+                absolute = urljoin(page_url, href)
+                if absolute not in urls:
+                    urls.append(absolute)
+            return urls
 
         pages = [response.text]
         status_code = response.status_code
         final_url = response.url
-        for page_url in page_urls[:50]:
+        seen_urls = {response.url}
+        queued_urls = pagination_urls(response.text, response.url)
+        if len(queued_urls) + 1 > self.MAX_PAGED_RESULT_PAGES:
+            raise PortalSearchCompletenessError("Agile exceeded the maximum page request cap")
+        first_applications = self.parse_listing(response.text, response.url)
+        seen_ids = {application.uid for application in first_applications}
+        seen_signatures = {
+            tuple(application.uid for application in first_applications)
+        } if first_applications else set()
+        processed_pages = 1
+        while queued_urls:
+            page_url = queued_urls.pop(0)
+            if page_url in seen_urls:
+                continue
+            if processed_pages >= self.MAX_PAGED_RESULT_PAGES:
+                raise PortalSearchCompletenessError("Agile exceeded the maximum page request cap")
+            seen_urls.add(page_url)
             page = self.http.get(page_url)
+            processed_pages += 1
+            page_applications = self.parse_listing(page.text, page.url)
+            signature = tuple(application.uid for application in page_applications)
+            if signature and signature in seen_signatures:
+                raise PortalSearchCompletenessError("Agile returned a repeated result page")
+            if signature:
+                seen_signatures.add(signature)
+            new_ids = {application.uid for application in page_applications} - seen_ids
+            discovered_urls = pagination_urls(page.text, page.url)
+            unseen_urls = [
+                url for url in discovered_urls if url not in seen_urls and url not in queued_urls
+            ]
+            if not new_ids and unseen_urls:
+                raise PortalSearchCompletenessError("Agile pagination made no unique-result progress")
+            seen_ids.update(new_ids)
+            queued_urls.extend(unseen_urls)
             pages.append(page.text)
             status_code = page.status_code
             final_url = page.url
@@ -287,31 +327,28 @@ class AgilePlanningScraper(GenericLabelledPlanningScraper):
             request_path = f"{request_path}?{query}"
         response_url = f"{base.scheme}://{base.netloc}{request_path}"
 
-        verify_options = (self.http.verify_tls, False) if self.http.verify_tls else (False,)
-        for verify_tls in verify_options:
-            context = ssl.create_default_context() if verify_tls else ssl._create_unverified_context()
-            connection = http.client.HTTPSConnection(
-                base.netloc,
-                timeout=self.http.timeout_seconds,
-                context=context,
-            )
-            try:
-                connection.putrequest("GET", request_path, skip_accept_encoding=True)
-                for key, value in self._api_headers(client_code).items():
-                    connection.putheader(key, value)
-                connection.endheaders()
-                response = connection.getresponse()
-                body = response.read()
-                text = body.decode(response.headers.get_content_charset() or "utf-8", errors="replace")
-                if response.status >= 400:
-                    raise CouncilFetchError(f"HTTP {response.status} while fetching {response_url}")
-                return text, response_url
-            except ssl.SSLCertVerificationError:
-                if not verify_tls:
-                    raise
-            finally:
-                connection.close()
-        raise CouncilFetchError(f"Could not establish a secure connection to {response_url}")
+        connection = http.client.HTTPSConnection(
+            base.netloc,
+            timeout=self.http.timeout_seconds,
+            context=self.http._ssl_context(),
+        )
+        try:
+            connection.putrequest("GET", request_path, skip_accept_encoding=True)
+            for key, value in self._api_headers(client_code).items():
+                connection.putheader(key, value)
+            connection.endheaders()
+            response = connection.getresponse()
+            body = response.read()
+            text = body.decode(response.headers.get_content_charset() or "utf-8", errors="replace")
+            if response.status >= 400:
+                raise CouncilFetchError(f"HTTP {response.status} while fetching {response_url}")
+            return text, response_url
+        except ssl.SSLCertVerificationError as exc:
+            raise CouncilFetchError(
+                f"TLS certificate verification failed while fetching {response_url}: {exc}"
+            ) from exc
+        finally:
+            connection.close()
 
     def _application_from_record(
         self,

@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 
 from lxml import html
 
-from planning_ping.backend.adapters.base import PlanningScraper
+from planning_ping.backend.adapters.base import PlanningScraper, PortalSearchCompletenessError
 from planning_ping.backend.http import CouncilHttpClient, FetchResponse
 from planning_ping.backend.adapter_models import DiscoveryResult, PlanningApplication, PlanningDocument
 from planning_ping.backend.parsing import (
@@ -151,12 +151,16 @@ class OcellaPlanningScraper(PlanningScraper):
     ) -> FetchResponse:
         response = self._post_received_date_search(search_url, base_data, start_date=start_date, end_date=end_date)
         cap = self._result_cap(response.text)
-        if not (cap and start_date and end_date and start_date < end_date):
+        if not cap:
             return response
 
         shown, total = cap
         if total <= shown:
             return response
+        if not (start_date and end_date and start_date < end_date):
+            raise PortalSearchCompletenessError(
+                "Ocella hit its result cap for a date window that cannot be split further"
+            )
 
         midpoint = start_date + timedelta(days=(end_date - start_date).days // 2)
         next_start = midpoint + timedelta(days=1)

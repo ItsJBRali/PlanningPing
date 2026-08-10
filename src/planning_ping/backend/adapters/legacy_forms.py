@@ -161,6 +161,7 @@ class NativeListingScraper(PlanningScraper):
 
 class TascomiPlanningScraper(NativeListingScraper):
     family = "tascomi"
+    MAX_PAGED_RESULT_PAGES = 250
 
     def search(
         self,
@@ -223,7 +224,7 @@ class TascomiPlanningScraper(NativeListingScraper):
         seen = {(application.reference or application.uid).casefold() for application in applications}
         if form is not None and (limit is None or len(applications) < limit):
             action = self._absolute_action(response.url, form)
-            for page in range(2, 251):
+            for page in range(2, self.MAX_PAGED_RESULT_PAGES + 1):
                 page_data = {key: value for key, value in data.items() if value}
                 page_data.update(
                     {
@@ -253,12 +254,20 @@ class TascomiPlanningScraper(NativeListingScraper):
                     if (application.reference or application.uid).casefold() not in seen
                 ]
                 if not new_applications:
+                    if page_applications:
+                        raise PortalSearchCompletenessError(
+                            "Tascomi pagination made no unique-result progress"
+                        )
                     break
                 for application in new_applications:
                     seen.add((application.reference or application.uid).casefold())
                 applications.extend(new_applications)
                 if limit is not None and len(applications) >= limit:
                     break
+                if page >= self.MAX_PAGED_RESULT_PAGES:
+                    raise PortalSearchCompletenessError(
+                        "Tascomi exceeded the maximum page request cap"
+                    )
 
         inferred_date = start_date or end_date
         for application in applications:

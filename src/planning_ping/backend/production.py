@@ -43,6 +43,7 @@ from .adapters import (
     authority_specific_scraper,
 )
 from .adapters.base import PlanningScraper
+from .adapters.base import PortalSearchCompletenessError
 from .http import CouncilHttpClient, monitor_council_requests
 from .models import ApplicationDocument, Council, PlanningApplication
 from .orchestration import AuthoritySearchResult
@@ -176,12 +177,23 @@ class ProductionAuthoritySearcher:
                 for discovered in discovery.applications:
                     if cancel_event.is_set():
                         raise RuntimeError(f"Search cancelled while fetching details for {council.name}")
-                    complete = scraper.fetch_application(
-                        discovered.uid,
-                        discovered.url,
-                        include_documents=True,
-                    )
-                    details.append(_from_adapter(council, complete))
+                    if scraper.discovery_is_detail_complete(discovered):
+                        complete = discovered
+                    else:
+                        complete = scraper.fetch_application(
+                            discovered.uid,
+                            discovered.url,
+                            include_documents=True,
+                        )
+                    application = _from_adapter(council, complete)
+                    if (
+                        application.application_date is not None
+                        and not start_date <= application.application_date <= end_date
+                    ):
+                        raise PortalSearchCompletenessError(
+                            f"{council.name} ignored the requested application date range"
+                        )
+                    details.append(application)
             return AuthoritySearchResult(tuple(details))
         finally:
             scraper.close()
@@ -278,8 +290,8 @@ def _from_adapter(council: Council, source: AdapterApplication) -> PlanningAppli
         case_officer=source.case_officer,
         ward=source.ward,
         parish=source.parish,
-        longitude=_float_value(raw.get("longitude") or raw.get("location_x")),
-        latitude=_float_value(raw.get("latitude") or raw.get("location_y")),
+        longitude=_float_value(_first_present(raw.get("longitude"), raw.get("location_x"))),
+        latitude=_float_value(_first_present(raw.get("latitude"), raw.get("location_y"))),
         scraped_at=_parse_datetime(source.date_scraped),
         raw=raw,
         documents=tuple(
@@ -364,6 +376,13 @@ def _float_value(value: object) -> float | None:
         return float(value) if value not in (None, "") else None
     except (TypeError, ValueError):
         return None
+
+
+def _first_present(*values: object) -> object | None:
+    for value in values:
+        if value is not None and (not isinstance(value, str) or value.strip()):
+            return value
+    return None
 
 
 def _origin(url: str) -> str:

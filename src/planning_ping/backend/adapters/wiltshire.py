@@ -31,7 +31,6 @@ class WiltshirePlanningScraper(PlanningScraper):
         super().__init__(config.authority)
         self.config = config
         self.http = http_client or CouncilHttpClient(
-            verify_tls=False,
             min_delay_seconds=1.25,
             retries=5,
             concurrency_key="portal:salesforce-custom",
@@ -74,6 +73,12 @@ class WiltshirePlanningScraper(PlanningScraper):
         include_documents: bool = False,
     ) -> PlanningApplication:
         raise ValueError("Wiltshire search results are complete enough for lead matching")
+
+    def discovery_is_detail_complete(self, application: PlanningApplication) -> bool:
+        return (
+            application.raw.get("detail_complete") is True
+            and application.raw.get("date_range_filtered") is True
+        )
 
     def _search_records(
         self,

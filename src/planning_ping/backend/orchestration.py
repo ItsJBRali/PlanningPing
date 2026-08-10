@@ -48,6 +48,7 @@ class AuthoritySearcher(Protocol):
 @dataclass(slots=True)
 class _CouncilState:
     council: Council
+    started_at: datetime
     primary: AuthoritySearchResult | None = None
     primary_error: Exception | None = None
 
@@ -92,6 +93,7 @@ class PlanningSearchService:
         for council in councils:
             if cancel_event.is_set():
                 break
+            council_started_at = self._clock()
             emit(
                 SearchEvent(
                     kind="council_started",
@@ -101,7 +103,7 @@ class PlanningSearchService:
                     total=len(councils),
                 )
             )
-            state = _CouncilState(council)
+            state = _CouncilState(council, council_started_at)
             try:
                 state.primary = self._searcher.search_primary(
                     council, request.start_date, request.end_date, cancel_event
@@ -126,7 +128,6 @@ class PlanningSearchService:
         failed_count = 0
         completed = 0
         for state in states:
-            council_started_at = self._clock()
             if cancel_event.is_set():
                 remaining = states[completed:]
                 return self._finish_cancelled(
@@ -189,7 +190,7 @@ class PlanningSearchService:
                 matched,
                 outcome=outcome,
                 exception=problem,
-                started_at=council_started_at,
+                started_at=state.started_at,
                 finished_at=self._clock(),
             )
             for application, _application_id in zip(matched, ids):
@@ -285,21 +286,15 @@ class PlanningSearchService:
         for state in states:
             primary_items = state.primary.applications if state.primary else ()
             matched = self._matching_applications(primary_items, uploaded_geometries, request)
-            if state.primary_error:
-                outcome = "error"
-                failed_count += 1
-                problem = state.primary_error
-            else:
-                outcome = "cancelled"
-                problem = None
-                if not matched:
-                    empty_count += 1
+            problem = state.primary_error
             ids = self._database.save_council_result(
                 run_id,
                 state.council,
                 matched,
-                outcome=outcome,
+                outcome="cancelled",
                 exception=problem,
+                started_at=state.started_at,
+                finished_at=self._clock(),
             )
             for application, _application_id in zip(matched, ids):
                 saved_count += 1
@@ -314,17 +309,6 @@ class PlanningSearchService:
                         message=application.reference,
                     )
                 )
-            completed += 1
-            emit(
-                SearchEvent(
-                    kind="council_finished",
-                    run_id=run_id,
-                    council=state.council.name,
-                    completed=completed,
-                    total=len(councils),
-                    saved_count=saved_count,
-                )
-            )
         finished_at = self._clock()
         self._database.finish_search(
             run_id,

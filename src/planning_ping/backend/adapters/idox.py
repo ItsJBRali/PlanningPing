@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from lxml import html
 
-from planning_ping.backend.adapters.base import PlanningScraper
+from planning_ping.backend.adapters.base import PlanningScraper, PortalSearchCompletenessError
 from planning_ping.backend.http import (
     CouncilBrowserClient,
     CouncilFetchError,
@@ -166,32 +166,67 @@ class IdoxPublicAccessScraper(PlanningScraper):
         applications: list[PlanningApplication] = []
         seen_uids: set[str] = set()
         seen_urls: set[str] = {response.url}
+        seen_page_signatures: set[tuple[str, ...]] = set()
         queued_urls = self._paged_result_urls(response.text, response.url)
         processed_pages = 1
+        expected_total = self._reported_result_total(response.text)
 
-        def add_page(html_text: str, page_url: str) -> None:
-            for application in self.parse_listing(html_text, page_url):
+        def add_page(html_text: str, page_url: str) -> int:
+            page_applications = self.parse_listing(html_text, page_url)
+            signature = tuple(application.uid for application in page_applications)
+            if signature and signature in seen_page_signatures:
+                raise PortalSearchCompletenessError("Idox returned a repeated result page")
+            if signature:
+                seen_page_signatures.add(signature)
+            added = 0
+            for application in page_applications:
                 if application.uid in seen_uids:
                     continue
                 seen_uids.add(application.uid)
                 applications.append(application)
+                added += 1
+            return added
 
         add_page(response.text, response.url)
         while queued_urls and (limit is None or len(applications) < limit):
-            if processed_pages >= self.MAX_PAGED_RESULT_PAGES:
-                break
             page_url = queued_urls.pop(0)
             if page_url in seen_urls:
                 continue
+            if processed_pages >= self.MAX_PAGED_RESULT_PAGES:
+                raise PortalSearchCompletenessError("Idox exceeded the maximum page request cap")
             seen_urls.add(page_url)
             page = self.http.get(page_url)
             processed_pages += 1
-            add_page(page.text, page.url)
-            for discovered_url in self._paged_result_urls(page.text, page.url):
+            page_total = self._reported_result_total(page.text)
+            if page_total is not None:
+                if expected_total is None:
+                    expected_total = page_total
+                elif page_total != expected_total:
+                    raise PortalSearchCompletenessError("Idox changed its reported total during pagination")
+            added = add_page(page.text, page.url)
+            discovered_urls = self._paged_result_urls(page.text, page.url)
+            if discovered_urls and added == 0:
+                raise PortalSearchCompletenessError("Idox pagination made no unique-result progress")
+            for discovered_url in discovered_urls:
                 if discovered_url not in seen_urls and discovered_url not in queued_urls:
                     queued_urls.append(discovered_url)
             queued_urls.sort(key=self._paged_result_sort_key)
+        if limit is None and expected_total is not None and len(applications) != expected_total:
+            raise PortalSearchCompletenessError(
+                f"Idox returned {len(applications)} results below its reported total of {expected_total}"
+            )
         return applications
+
+    def _reported_result_total(self, html_text: str) -> int | None:
+        visible = clean_text(" ".join(html.fromstring(html_text).xpath("//text()"))) or ""
+        for pattern in (
+            r"\bDisplaying\s+\d+\s*(?:-|to)\s*\d+\s+of\s+(\d+)\b",
+            r"\bResults?\s+\d+\s*(?:-|to)\s*\d+\s+of\s+(\d+)\b",
+        ):
+            match = re.search(pattern, visible, flags=re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+        return None
 
     def _paged_result_urls(self, html_text: str, page_url: str) -> list[str]:
         document = html.fromstring(html_text)

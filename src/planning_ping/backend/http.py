@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import base64
 from datetime import datetime, timezone
 from http.cookiejar import CookieJar
 from dataclasses import dataclass
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 import json
 import re
 import ssl
@@ -133,6 +132,7 @@ class CouncilHttpClient:
     _shared_last_request_at: dict[str, float] = {}
     _blocked_until: dict[str, float] = {}
     _concurrency_gates: dict[tuple[str, int], threading.BoundedSemaphore] = {}
+    _hostname_gates: dict[str, threading.BoundedSemaphore] = {}
 
     def __init__(
         self,
@@ -155,12 +155,13 @@ class CouncilHttpClient:
         self.min_delay_seconds = min_delay_seconds
         self.user_agent = user_agent
         self.retries = retries
-        self.verify_tls = verify_tls
+        if not verify_tls:
+            raise ValueError("TLS certificate verification cannot be disabled")
+        self.verify_tls = True
         self.ca_file = ca_file
         self.rate_limit_key = rate_limit_key
         self.concurrency_key = concurrency_key
         self.concurrency_limit = max(concurrency_limit, 1)
-        self._tls_compat = False
         self._cookies = CookieJar()
 
     def get(
@@ -251,8 +252,9 @@ class CouncilHttpClient:
     def _send(self, request: Request, url: str) -> FetchResponse:
         response = self._send_raw(request, url)
         body = response.body.decode(response.charset, errors="replace")
-        if _looks_like_waf_challenge(body):
-            raise CouncilFetchError(f"Blocked by web application firewall while fetching {url}")
+        blocked_reason = _blocked_page_reason(body, "")
+        if blocked_reason:
+            raise CouncilFetchError(f"{blocked_reason} while fetching {url}")
         return FetchResponse(
             url=response.url,
             status_code=response.status_code,
@@ -265,7 +267,7 @@ class CouncilHttpClient:
             _raise_if_request_cancelled()
             _report_request_activity()
             try:
-                with self._request_slot():
+                with self._request_slot(url):
                     _raise_if_request_cancelled()
                     self._wait_for_turn(url)
                     _raise_if_request_cancelled()
@@ -297,14 +299,10 @@ class CouncilHttpClient:
                     raise CouncilFetchError(f"HTTP {exc.code} while fetching {url}") from exc
                 last_error = exc
             except URLError as exc:
-                if self.verify_tls and _is_tls_certificate_error(exc):
-                    self.verify_tls = False
-                    last_error = exc
-                    continue
-                if not self._tls_compat and _is_tls_compatibility_error(exc):
-                    self._tls_compat = True
-                    last_error = exc
-                    continue
+                if _is_tls_certificate_error(exc):
+                    raise CouncilFetchError(
+                        f"TLS certificate verification failed while fetching {url}: {exc.reason}"
+                    ) from exc
                 if attempt == self.retries:
                     raise CouncilFetchError(f"Network error while fetching {url}: {exc.reason}") from exc
                 last_error = exc
@@ -351,16 +349,27 @@ class CouncilHttpClient:
     def configured_host_key(self) -> str:
         return f"client:{id(self)}"
 
-    def _request_slot(self):
-        if not self.concurrency_key:
-            return nullcontext()
-        gate_key = (self.concurrency_key, self.concurrency_limit)
+    @contextmanager
+    def _request_slot(self, url: str):
+        hostname = urlsplit(url).netloc.casefold()
         with self._concurrency_lock:
-            gate = self._concurrency_gates.get(gate_key)
-            if gate is None:
-                gate = threading.BoundedSemaphore(self.concurrency_limit)
-                self._concurrency_gates[gate_key] = gate
-        return self._cancellable_request_slot(gate)
+            host_gate = self._hostname_gates.get(hostname)
+            if host_gate is None:
+                host_gate = threading.BoundedSemaphore(1)
+                self._hostname_gates[hostname] = host_gate
+            platform_gate = None
+            if self.concurrency_key:
+                gate_key = (self.concurrency_key, self.concurrency_limit)
+                platform_gate = self._concurrency_gates.get(gate_key)
+                if platform_gate is None:
+                    platform_gate = threading.BoundedSemaphore(self.concurrency_limit)
+                    self._concurrency_gates[gate_key] = platform_gate
+        with self._cancellable_request_slot(host_gate):
+            if platform_gate is None:
+                yield
+            else:
+                with self._cancellable_request_slot(platform_gate):
+                    yield
 
     @contextmanager
     def _cancellable_request_slot(self, gate):
@@ -372,15 +381,10 @@ class CouncilHttpClient:
             gate.release()
 
     def _ssl_context(self) -> ssl.SSLContext | None:
-        if self.verify_tls and not self.ca_file and certifi is None:
+        if not self.ca_file and certifi is None:
             return None
-        if not self.verify_tls:
-            return ssl._create_unverified_context()
         cafile = self.ca_file or certifi.where()
-        context = ssl.create_default_context(cafile=cafile)
-        if self._tls_compat:
-            context.set_ciphers("DEFAULT:@SECLEVEL=1")
-        return context
+        return ssl.create_default_context(cafile=cafile)
 
     def _opener(self):
         handlers = [HTTPCookieProcessor(self._cookies)]
@@ -476,57 +480,6 @@ class CouncilBrowserClient:
         except Exception as exc:
             raise CouncilFetchError(f"Browser fallback could not submit {url}: {exc}") from exc
 
-    def get_bytes(
-        self,
-        url: str,
-        params: dict[str, str] | None = None,
-        headers: dict[str, str] | None = None,
-    ) -> BinaryFetchResponse:
-        """Fetch a file inside the active browser session used by JavaScript-only portals."""
-        del headers
-        if params:
-            separator = "&" if "?" in url else "?"
-            url = f"{url}{separator}{urlencode(params)}"
-        driver = self._ensure_driver()
-        try:
-            result = driver.execute_async_script(
-                """
-                const done = arguments[arguments.length - 1];
-                fetch(arguments[0], {credentials: 'same-origin'})
-                    .then(async (response) => {
-                        const bytes = new Uint8Array(await response.arrayBuffer());
-                        let binary = '';
-                        const chunkSize = 0x8000;
-                        for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-                            binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
-                        }
-                        done({
-                            status: response.status,
-                            url: response.url,
-                            body: btoa(binary)
-                        });
-                    })
-                    .catch((error) => done({error: String(error)}));
-                """,
-                url,
-            )
-            _report_request_activity()
-            if not isinstance(result, dict) or result.get("error"):
-                detail = result.get("error") if isinstance(result, dict) else "no response"
-                raise CouncilFetchError(f"Browser fallback download failed for {url}: {detail}")
-            status_code = int(result.get("status") or 0)
-            if status_code >= 400:
-                raise CouncilFetchError(f"HTTP {status_code} while fetching {url}")
-            return BinaryFetchResponse(
-                url=str(result.get("url") or url),
-                status_code=status_code or 200,
-                body=base64.b64decode(str(result.get("body") or "")),
-            )
-        except CouncilFetchError:
-            raise
-        except Exception as exc:
-            raise CouncilFetchError(f"Browser fallback could not download {url}: {exc}") from exc
-
     def _post_ajax(self, url: str, data: dict[str, str]) -> FetchResponse:
         driver = self._ensure_driver()
         result = driver.execute_async_script(
@@ -606,18 +559,6 @@ class CouncilBrowserClient:
                 raise CouncilFetchError(
                     f"Chrome could not start ({chrome_error}); Edge could not start ({edge_error})"
                 ) from edge_error
-        try:
-            driver.execute_cdp_cmd(
-                "Page.addScriptToEvaluateOnNewDocument",
-                {
-                    "source": (
-                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                        "Object.defineProperty(navigator, 'languages', {get: () => ['en-GB', 'en']});"
-                    )
-                },
-            )
-        except Exception:
-            pass
         return driver
 
     def _configure_options(self, options) -> None:
@@ -627,64 +568,48 @@ class CouncilBrowserClient:
             "--no-sandbox",
             "--window-size=1280,1000",
             "--window-position=-32000,-32000",
-            "--disable-blink-features=AutomationControlled",
             "--lang=en-GB",
             "--log-level=3",
         ):
             options.add_argument(argument)
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option("useAutomationExtension", False)
 
     def _wait_for_usable_page(self) -> None:
         driver = self._ensure_driver()
+        self._raise_for_error_page()
 
         def ready(_driver) -> bool:
             _raise_if_request_cancelled()
             _report_request_activity()
             try:
                 source = _driver.page_source or ""
-                lowered = source[:6000].casefold()
-                title = (_driver.title or "").casefold()
+                reason = _blocked_page_reason(source, _driver.title or "")
+                if reason:
+                    raise CouncilFetchError(
+                        f"{reason} while fetching {getattr(_driver, 'current_url', '')}"
+                    )
                 ready_state = _driver.execute_script("return document.readyState") == "complete"
-                if ready_state and (
-                    "403 forbidden" in title
-                    or "service unavailable" in title
-                    or "bad gateway" in title
-                ):
-                    return True
-                challenge = len(source) < 5000 and (
-                    "javascript is disabled" in lowered
-                    or "awswaf" in lowered
-                    or "captcha-sdk.awswaf.com" in lowered
-                    or "incapsula incident id" in lowered
-                    or "request unsuccessful" in lowered
-                )
-                challenge = challenge or "checking you're not a bot" in lowered or "azure waf" in title
-                return ready_state and len(source) > 500 and not challenge
-            except Exception:
+                return ready_state and len(source) > 500
+            except CouncilFetchError:
+                raise
+            except WebDriverException:
                 return False
 
         try:
             WebDriverWait(driver, self.timeout_seconds, poll_frequency=0.25).until(ready)
+        except CouncilFetchError:
+            raise
         except Exception as exc:
             raise CouncilFetchError(
-                f"Browser challenge did not complete while fetching {getattr(driver, 'current_url', '')}"
+                f"Browser page did not become usable while fetching {getattr(driver, 'current_url', '')}"
             ) from exc
         self._raise_for_error_page()
 
     def _raise_for_error_page(self) -> None:
         driver = self._ensure_driver()
         source = driver.page_source or ""
-        title = (driver.title or "").casefold()
-        opening = source[:12000].casefold()
-        if any(
-            token in title
-            for token in ("403 forbidden", "service unavailable", "internal server error", "bad gateway")
-        ) or (
-            len(source) < 12000
-            and any(token in opening for token in ("403 forbidden", ">503<", "service unavailable", "bad gateway"))
-        ):
-            raise CouncilFetchError(f"Council website error page while fetching {driver.current_url}")
+        reason = _blocked_page_reason(source, driver.title or "")
+        if reason:
+            raise CouncilFetchError(f"{reason} while fetching {driver.current_url}")
 
     def _response(self) -> FetchResponse:
         driver = self._ensure_driver()
@@ -702,14 +627,8 @@ def browser_fallback_recommended(exc: Exception) -> bool:
     return any(
         token in text
         for token in (
-            "http 403",
             "http 405",
-            "http 503",
             "empty response",
-            "web application firewall",
-            "council website error page",
-            "unexpected_eof_while_reading",
-            "eof occurred in violation of protocol",
             "northgate date search was not accepted",
         )
     )
@@ -741,29 +660,40 @@ def _is_tls_certificate_error(exc: Exception) -> bool:
     return "certificate" in text and "ssl" in text
 
 
-def _is_tls_compatibility_error(exc: Exception) -> bool:
-    reason = getattr(exc, "reason", None)
-    text = f"{reason or ''} {exc}".casefold()
-    return any(token in text for token in ("forcibly closed", "winerror 10054")) or (
-        "ssl" in text
-        and any(
-            token in text
-            for token in (
-                "dh key too small",
-                "legacy sigalg disallowed",
-                "unsafe legacy renegotiation",
-                "tlsv1 alert protocol version",
-                "wrong version number",
-                "unexpected_eof_while_reading",
-                "eof occurred in violation of protocol",
-            )
+def _blocked_page_reason(text: str, title: str) -> str | None:
+    opening = text[:12000].casefold()
+    normalized_title = title.casefold()
+    if any(
+        token in opening or token in normalized_title
+        for token in (
+            "_incapsula_resource",
+            "incapsula incident id",
+            "captcha-sdk.awswaf.com",
+            "awswaf",
+            "checking you're not a bot",
+            "cf-chl-",
+            "cloudflare ray id",
+            "azure waf",
         )
-    )
-
-
-def _looks_like_waf_challenge(text: str) -> bool:
-    lowered = text[:5000].casefold()
-    return "_incapsula_resource" in lowered or "incapsula" in lowered and "noindex,nofollow" in lowered
+    ):
+        return "Web application firewall challenge detected"
+    if "captcha" in opening or "captcha" in normalized_title:
+        return "CAPTCHA challenge detected"
+    if any(token in normalized_title for token in ("403 forbidden", "access denied", "unauthorized", "sign in")):
+        return "Authentication or access-control page detected"
+    if len(text) < 12000 and any(
+        token in opening for token in ("403 forbidden", "access denied", ">401<", "unauthorized")
+    ):
+        return "Authentication or access-control page detected"
+    if any(
+        token in normalized_title
+        for token in ("service unavailable", "internal server error", "bad gateway")
+    ) or (
+        len(text) < 12000
+        and any(token in opening for token in (">503<", "service unavailable", "bad gateway"))
+    ):
+        return "Council website error page detected"
+    return None
 
 
 def _disclaimer_accept_url(response: FetchResponse) -> str | None:

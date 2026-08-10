@@ -27,6 +27,11 @@ class PlanningScraper(ABC):
     ) -> PlanningApplication:
         """Fetch and normalize one application detail page."""
 
+    def discovery_is_detail_complete(self, application: PlanningApplication) -> bool:
+        """Return true only for adapters whose search endpoint is their complete record boundary."""
+
+        return False
+
     def close(self) -> None:
         client = getattr(self, "http", None)
         close = getattr(client, "close", None)

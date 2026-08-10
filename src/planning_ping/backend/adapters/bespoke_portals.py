@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from lxml import html
 
 from planning_ping.backend.adapters.arcus import ArcusPlanningScraper
+from planning_ping.backend.adapters.base import PortalSearchCompletenessError
 from planning_ping.backend.adapters.legacy_forms import (
     LegacyFormsCouncilConfig,
     NativeListingScraper,
@@ -35,7 +36,7 @@ class BathPlanningScraper(NativeListingScraper):
         *,
         http_client: CouncilHttpClient | None = None,
     ) -> None:
-        super().__init__(config, http_client=http_client or CouncilHttpClient(verify_tls=False, retries=5))
+        super().__init__(config, http_client=http_client or CouncilHttpClient(retries=5))
 
     def search(
         self,
@@ -120,6 +121,7 @@ class ColchesterPlanningScraper(NativeListingScraper):
 
     family = "power_pages"
     page_size = 25
+    MAX_PAGED_RESULT_PAGES = 250
 
     def search(
         self,
@@ -146,7 +148,7 @@ class ColchesterPlanningScraper(NativeListingScraper):
         applications: list[PlanningApplication] = []
         seen: set[str] = set()
         paging_cookie = ""
-        for page_number in range(1, 251):
+        for page_number in range(1, self.MAX_PAGED_RESULT_PAGES + 1):
             payload = {
                 "base64SecureConfiguration": secure_configuration,
                 "sortExpression": "new_registration_date DESC,new_concatenatedaddress ASC",
@@ -203,6 +205,10 @@ class ColchesterPlanningScraper(NativeListingScraper):
                 break
             if not result.get("MoreRecords") or not records:
                 break
+            if page_number >= self.MAX_PAGED_RESULT_PAGES:
+                raise PortalSearchCompletenessError(
+                    "Colchester Power Pages exceeded the maximum page request cap"
+                )
             paging_cookie = str(result.get("NextPagePagingCookie") or "")
         return applications
 

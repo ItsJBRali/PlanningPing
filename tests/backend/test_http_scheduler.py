@@ -1,13 +1,26 @@
 from __future__ import annotations
 
 import sys
+import ssl
 import threading
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
+from urllib.error import URLError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from planning_ping.backend.http import CouncilFetchError, CouncilHttpClient, monitor_council_requests
+import planning_ping.backend.http as planning_http
+from planning_ping.backend.http import (
+    CouncilBrowserClient,
+    CouncilFetchError,
+    CouncilHttpClient,
+    browser_fallback_recommended,
+    monitor_council_requests,
+)
+from planning_ping.backend.adapters.arcus import ArcusCouncilConfig, ArcusPlanningScraper
+from planning_ping.backend.adapters.wiltshire import WiltshireCouncilConfig, WiltshirePlanningScraper
 from planning_ping.backend.scheduler import PlatformAwareScheduler, ScheduledTask
 
 
@@ -80,6 +93,155 @@ class HttpBoundaryTests(unittest.TestCase):
         with monitor_council_requests(lambda: None, should_cancel=lambda: True):
             with self.assertRaisesRegex(CouncilFetchError, "cancelled"):
                 Client(min_delay_seconds=0).get("https://planning.example.test")
+
+    def test_certificate_errors_remain_visible_and_never_retry_without_verification(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot be disabled"):
+            CouncilHttpClient(verify_tls=False)
+
+        class CertificateOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, request: object, timeout: float) -> FakeResponse:
+                self.calls += 1
+                if self.calls == 1:
+                    raise URLError(ssl.SSLCertVerificationError("certificate verify failed"))
+                return FakeResponse(b"<html>must not be reached</html>")
+
+        class Client(CouncilHttpClient):
+            def __init__(self) -> None:
+                super().__init__(min_delay_seconds=0, retries=1)
+                self.opener = CertificateOpener()
+
+            def _opener(self) -> CertificateOpener:
+                return self.opener
+
+            def _pause_before_retry(self, *args: object, **kwargs: object) -> None:
+                return None
+
+        client = Client()
+        with self.assertRaisesRegex(CouncilFetchError, "certificate|Network error"):
+            client.get("https://planning.example.test")
+        self.assertEqual(1, client.opener.calls)
+        self.assertTrue(client.verify_tls)
+
+    def test_production_salesforce_adapters_use_verified_tls(self) -> None:
+        arcus = ArcusPlanningScraper(ArcusCouncilConfig("Alpha", "https://alpha.test"))
+        wiltshire = WiltshirePlanningScraper(WiltshireCouncilConfig("Wiltshire", "https://wiltshire.test"))
+        try:
+            self.assertTrue(arcus.http.verify_tls)
+            self.assertTrue(wiltshire.http.verify_tls)
+        finally:
+            arcus.close()
+            wiltshire.close()
+
+    def test_requests_from_different_clients_share_one_hostname_gate(self) -> None:
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        release = threading.Event()
+        errors: list[Exception] = []
+
+        class BlockingResponse(FakeResponse):
+            def __init__(self, entered: threading.Event) -> None:
+                super().__init__(b"<html>ready</html>")
+                self.entered = entered
+
+            def read(self) -> bytes:
+                self.entered.set()
+                release.wait(2)
+                return self.body
+
+        class Opener:
+            def __init__(self, entered: threading.Event) -> None:
+                self.entered = entered
+
+            def open(self, request: object, timeout: float) -> BlockingResponse:
+                return BlockingResponse(self.entered)
+
+        class Client(CouncilHttpClient):
+            def __init__(self, key: str, entered: threading.Event) -> None:
+                super().__init__(min_delay_seconds=0, concurrency_key=key, concurrency_limit=2)
+                self.opener = Opener(entered)
+
+            def _opener(self) -> Opener:
+                return self.opener
+
+        def fetch(client: Client, path: str) -> None:
+            try:
+                client.get(f"https://shared-host.test/{path}")
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        first = threading.Thread(target=fetch, args=(Client("idox", first_entered), "one"))
+        second = threading.Thread(target=fetch, args=(Client("northgate", second_entered), "two"))
+        try:
+            first.start()
+            self.assertTrue(first_entered.wait(1))
+            second.start()
+            time.sleep(0.1)
+            self.assertFalse(second_entered.is_set())
+        finally:
+            release.set()
+            first.join(2)
+            second.join(2)
+        self.assertFalse(errors)
+
+    def test_browser_keeps_webdriver_visible_and_rejects_challenges_without_waiting(self) -> None:
+        class FakeOptions:
+            def __init__(self) -> None:
+                self.arguments: list[str] = []
+                self.experimental: list[tuple[str, object]] = []
+
+            def add_argument(self, value: str) -> None:
+                self.arguments.append(value)
+
+            def add_experimental_option(self, name: str, value: object) -> None:
+                self.experimental.append((name, value))
+
+        class FakeDriver:
+            page_source = '<script src="https://captcha-sdk.awswaf.com/captcha.js"></script>'
+            title = "Checking your browser"
+            current_url = "https://planning.example.test/search"
+
+            def __init__(self, options: FakeOptions | None = None) -> None:
+                self.options = options
+                self.cdp_commands: list[tuple[str, object]] = []
+
+            def execute_cdp_cmd(self, command: str, payload: object) -> None:
+                self.cdp_commands.append((command, payload))
+
+        with (
+            mock.patch.object(planning_http, "ChromeOptions", FakeOptions),
+            mock.patch.object(planning_http, "ChromeWebDriver", FakeDriver),
+        ):
+            driver = CouncilBrowserClient()._create_driver()
+
+        self.assertFalse(driver.cdp_commands)
+        self.assertFalse(any("AutomationControlled" in item for item in driver.options.arguments))
+        self.assertNotIn(("excludeSwitches", ["enable-automation"]), driver.options.experimental)
+
+        browser = CouncilBrowserClient()
+        browser._driver = FakeDriver()
+        with self.assertRaisesRegex(CouncilFetchError, "CAPTCHA|firewall"):
+            browser._raise_for_error_page()
+        with mock.patch.object(
+            planning_http,
+            "WebDriverWait",
+            side_effect=AssertionError("challenge pages must fail before a browser wait"),
+        ):
+            with self.assertRaisesRegex(CouncilFetchError, "CAPTCHA|firewall"):
+                browser._wait_for_usable_page()
+
+    def test_browser_fallback_is_never_recommended_for_access_controls(self) -> None:
+        for message in (
+            "Blocked by web application firewall",
+            "CAPTCHA challenge detected",
+            "HTTP 403 while fetching portal",
+            "HTTP 503 while fetching portal",
+            "SSL certificate verify failed",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(browser_fallback_recommended(CouncilFetchError(message)))
 
 
 class SchedulerBoundaryTests(unittest.TestCase):

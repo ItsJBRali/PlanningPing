@@ -110,3 +110,45 @@ Primary discovery/details run before serial PlanIt reconciliation. Primary refer
 - Exhaustive live council searches were intentionally not run, per the brief. Portal reachability can change independently of this build.
 - The PyInstaller executable build/startup smoke is an integration-task check because the UI-owned entrypoint does not exist on the `search` branch alone. The spec is ready for the frontend merge.
 - A separate reviewer agent could not be allocated because the collaboration thread was at its agent limit; the line-by-line self-review and fresh verification above were completed instead.
+
+## Review Fix Round 1
+
+Status: DONE. All eight review findings were reproduced with focused regressions and fixed. The frozen runtime literal validation remains covered by positive tests for all seven event kinds and all three summary statuses plus negative tests for invalid values.
+
+### RED/GREEN evidence and finding dispositions
+
+1. **Arcus/Wiltshire nonempty discovery — fixed.** RED: a detail-complete discovery record called the adapters' intentionally unavailable `fetch_application` method and failed; an out-of-range primary detail was silently returned. GREEN: production now uses an explicit adapter capability that only Arcus and Wiltshire opt into after verifying both completeness/date-range markers, preserves the discovered normalized record/document metadata, still fetches every ordinary adapter detail, propagates ordinary detail failures, and raises `PortalSearchCompletenessError` for off-range details. The real Arcus and Wiltshire subclasses are covered with nonempty discoveries.
+2. **Automation evasion/WAF-CAPTCHA behavior — fixed.** RED: Selenium options suppressed automation signals, injected a `navigator.webdriver` override, WAF/CAPTCHA pages were waited out, and access-control/server errors recommended browser fallback. GREEN: all evasion switches and CDP injection are removed; browser rendering leaves WebDriver truth intact; authentication, WAF, CAPTCHA, and server-error pages terminate immediately as visible `CouncilFetchError`s; fallback is limited to ordinary rendering/method cases. A source audit reports zero evasion patterns.
+3. **Silent completeness gaps — fixed.** RED: Idox returned at its page cap and on repeated/no-progress pages, Atrium sliced pagination, Northgate returned below its advertised total, Arcus/Ocella returned unsplittable capped windows, Agile/Power Pages truncated at fixed bounds, and the production boundary accepted off-range primary details. GREEN: Idox, Atrium, Northgate, Agile, Tascomi, Colchester Power Pages, Arcus, and Ocella now raise explicit completeness exceptions for applicable caps, repeated pages, no unique progress, changed/reported-total mismatches, and unsplittable threshold windows. Existing CCED, StatMap, Fastweb/Socrata guards were audited and retained. PlanIt and the production primary boundary retain date/total/repeat/cap guards.
+4. **Global one-request-per-host gate — fixed.** RED: two clients with different portal-family keys entered the same hostname concurrently. GREEN: every HTTP request first acquires a process-wide hostname semaphore, then its optional platform gate; the cross-client concurrency regression proves serialization. The adaptive scheduler's host/rate-limit behavior remains covered.
+5. **TLS verification — fixed.** RED: certificate failure retried after mutating `verify_tls=False`, and Arcus/Wiltshire/Bath plus Agile contained unverified fallback paths. GREEN: verification cannot be disabled, certificate failures terminate visibly without an unverified retry, automatic cipher/security downgrades are gone, every adapter uses trusted default/configured CAs, and source audit finds no unverified-context pattern.
+6. **Greenwich coordinates — fixed.** RED: truthiness coalescing replaced valid longitude/latitude `0.0` with fallback coordinates. GREEN: fallback occurs only for `None`/blank; `(0.0, 0.0)` is retained and verified as an exact boundary match.
+7. **Cancellation aggregates — fixed.** RED: cancelled councils incremented searched/completed and sometimes empty/failed counts, with `council_finished` events for unfinished councils. GREEN: unfinished states persist usable primary records under a distinct `cancelled` outcome without incrementing searched, empty, or failed counts and without completion events; already reconciled councils and their counts remain durable.
+8. **Council start timestamp — fixed.** RED: the persisted outcome start was the later PlanIt-phase time. GREEN: `_CouncilState` captures the primary-phase start and supplies it to both normal and cancelled outcome persistence.
+
+Focused RED examples produced the expected failures: two production-boundary failures; seven HTTP/security/concurrency failures across five tests; five adapter-completeness failures; and three cancellation/timestamp failures. Focused GREEN results: production 9/9, HTTP/scheduler 8/8, adapter completeness 6/6, and orchestration 5/5.
+
+### Fix-round files
+
+- Production/adapter boundary: `src/planning_ping/backend/production.py`, `src/planning_ping/backend/adapters/base.py`, `arcus.py`, and `wiltshire.py`.
+- Completeness: `agile.py`, `atrium.py`, `idox.py`, `northgate.py`, `ocella.py`, `bespoke_portals.py`, and `legacy_forms.py`.
+- HTTP/security/concurrency: `src/planning_ping/backend/http.py`.
+- Cancellation/timestamps: `src/planning_ping/backend/orchestration.py`.
+- Regressions: `tests/backend/test_adapter_completeness.py`, `test_http_scheduler.py`, `test_orchestration.py`, and `test_production_search.py`.
+
+### Fresh fix-round verification and audits
+
+- Full suite: `uv --system-certs run --link-mode copy --python 3.11 python -m unittest discover -s tests -v` — **64 tests, 0 failures**.
+- Compile: `uv --system-certs run --link-mode copy --python 3.11 python -m compileall -q src tools` — exit 0.
+- Offline catalogue audit: **399 rows, 399 pass, 0 fail**; no live council requests.
+- `git diff --check` — exit 0.
+- Security-evasion/TLS audit — 0 occurrences of unverified contexts, disabled certificate checks, WebDriver suppression, `AutomationControlled`, or automation-switch hiding.
+- Document payload audit — 0 backend filesystem payload writes. The unused Selenium binary-download path was removed. The retained `CouncilHttpClient.get_bytes` is only called by Kensington's binary primary-record search API; document-looking URLs in adapters are stored as metadata only.
+- Fixed-cap audit — all production fixed page bounds located by source search now terminate with visible completeness exceptions; date parsing/year iteration and single-option selection slices are not pagination truncation.
+- Reusable source repository remains clean; no `src/planning_ping/ui/` change; nothing pushed.
+
+### Fix-round self-review and concerns
+
+- Completeness/YAGNI: fixes are confined to the reviewed production boundaries and shared infrastructure; no UI, document payload, OCR, lead-output, or unrelated feature code was added.
+- Test realism: orchestration uses real SQLite transactions; host concurrency uses two real threads and independent HTTP clients; adapter tests exercise production parser/pagination methods with deterministic response doubles; real Arcus/Wiltshire types cover the detail-complete capability.
+- Remaining concern: exhaustive live council searches remain intentionally unrun. Real portal markup, availability, and certificates can change externally, so bounded opt-in live smoke remains an integration activity.

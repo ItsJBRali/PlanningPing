@@ -144,10 +144,12 @@ class OrchestrationTests(unittest.TestCase):
         summary = service.run(self.request, events.append, cancel)
 
         self.assertEqual("cancelled", summary.status)
-        self.assertEqual(1, summary.searched_councils)
+        self.assertEqual(0, summary.searched_councils)
         self.assertEqual(1, summary.saved_applications)
+        self.assertEqual((0, 0), (summary.empty_councils, summary.failed_councils))
         self.assertEqual([("primary", "alpha")], searcher.calls)
         self.assertEqual("cancelled", events[-1].kind)
+        self.assertNotIn("council_finished", [event.kind for event in events])
         outcome = self.database.connection.execute("SELECT outcome_status FROM council_search_outcomes").fetchone()[0]
         self.assertEqual("cancelled", outcome)
 
@@ -158,8 +160,9 @@ class OrchestrationTests(unittest.TestCase):
         )
         cancel = Event()
         service = PlanningSearchService(self.database, AuthorityCatalogue(self.councils), searcher, clock=lambda: NOW)
+        events = []
 
-        summary = service.run(self.request, lambda event: None, cancel)
+        summary = service.run(self.request, events.append, cancel)
 
         outcomes = dict(
             self.database.connection.execute(
@@ -167,7 +170,45 @@ class OrchestrationTests(unittest.TestCase):
             )
         )
         self.assertEqual("cancelled", summary.status)
+        self.assertEqual((1, 0, 0), (summary.searched_councils, summary.empty_councils, summary.failed_councils))
+        self.assertEqual(1, [event.kind for event in events].count("council_finished"))
         self.assertEqual({"alpha": "success", "beta": "cancelled", "gamma": "cancelled"}, outcomes)
+
+    def test_council_outcome_started_at_is_the_primary_phase_start(self) -> None:
+        primary_started = datetime(2026, 1, 31, 9, 0, tzinfo=timezone.utc)
+        planit_started = datetime(2026, 1, 31, 9, 5, tzinfo=timezone.utc)
+
+        class MutableClock:
+            current = primary_started
+
+            def __call__(self) -> datetime:
+                return self.current
+
+        clock = MutableClock()
+
+        class AdvancingSearcher(FakeAuthoritySearcher):
+            def search_primary(self, council: Council, start_date: date, end_date: date, cancel_event: Event) -> AuthoritySearchResult:
+                result = super().search_primary(council, start_date, end_date, cancel_event)
+                clock.current = planit_started
+                return result
+
+        searcher = AdvancingSearcher(
+            primary={"alpha": [make_application("alpha", "A1")]},
+            planit={"alpha": []},
+        )
+        service = PlanningSearchService(
+            self.database,
+            AuthorityCatalogue([self.councils[0]]),
+            searcher,
+            clock=clock,
+        )
+
+        service.run(self.request, lambda event: None, Event())
+
+        stored = self.database.connection.execute(
+            "SELECT started_at FROM council_search_outcomes"
+        ).fetchone()[0]
+        self.assertEqual(primary_started.isoformat(), stored)
 
 
 if __name__ == "__main__":
