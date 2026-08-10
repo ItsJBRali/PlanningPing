@@ -44,6 +44,11 @@ class PlanningPingAppSmokeTests(unittest.TestCase):
             self.app.navigate(route)
             self.assertEqual(self.app.active_route, route)
             self.assertEqual(id(self.app.screens[route]), original_ids[route])
+            self.app.update_idletasks()
+            self.assertEqual(
+                [name for name, screen in self.app.screens.items() if screen.grid_info()],
+                [route],
+            )
 
     def test_home_action_cards_reach_each_primary_destination(self) -> None:
         home = self.app.screens["home"]
@@ -83,6 +88,20 @@ class PlanningPingAppSmokeTests(unittest.TestCase):
             time.sleep(0.005)
         self.assertFalse(saved._query_controller.running)
         self.assertFalse(issues._query_controller.running)
+
+    def test_clear_filters_cannot_mutate_state_during_a_saved_query(self) -> None:
+        saved = self.app.screens["search_saved"]
+        saved.filter_vars["reference"].set("REF-LOCKED")
+        saved._search()
+        self.assertTrue(saved._query_controller.running)
+        self.assertEqual(saved.clear_button.cget("state"), "disabled")
+        saved._clear()
+        self.assertEqual(saved.filter_vars["reference"].get(), "REF-LOCKED")
+        self.assertEqual(saved.model.filter_values["reference"], "REF-LOCKED")
+        deadline = time.monotonic() + 2
+        while saved._query_controller.running and time.monotonic() < deadline:
+            self.app.update()
+            time.sleep(0.005)
 
     def test_search_validation_places_errors_with_the_relevant_field_group(self) -> None:
         screen = self.app.screens["search_new"]

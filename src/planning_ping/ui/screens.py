@@ -59,7 +59,7 @@ class HomeScreen(BaseScreen):
 class SearchNewScreen(BaseScreen):
     def __init__(self, master, service: SearchService, root):
         super().__init__(master)
-        self._root = root
+        self._app_root = root
         self._poll_job: str | None = None
         self._controller = SearchController(service, self._render_state)
         self.grid_columnconfigure(0, weight=1)
@@ -119,7 +119,7 @@ class SearchNewScreen(BaseScreen):
 
     def _on_drop(self, event):
         try:
-            selected = validate_geojson_selection(parse_drop_paths(event.data, self._root.tk.splitlist))
+            selected = validate_geojson_selection(parse_drop_paths(event.data, self._app_root.tk.splitlist))
         except ValueError as error:
             self.boundary_error_var.set(str(error))
             self.status_var.set("Boundary selection invalid")
@@ -236,7 +236,8 @@ class SearchSavedScreen(BaseScreen):
             ctk.CTkEntry(field, textvariable=self.filter_vars[name]).pack(fill="x")
         buttons = ctk.CTkFrame(self, fg_color="transparent")
         buttons.grid(row=2, column=0, sticky="ew", padx=SPACING["xl"], pady=SPACING["sm"])
-        FocusButton(buttons, text="Clear Filters", command=self._clear).pack(side="left")
+        self.clear_button = FocusButton(buttons, text="Clear Filters", command=self._clear)
+        self.clear_button.pack(side="left")
         self.search_button = FocusButton(buttons, text="Search", command=self._search)
         self.search_button.pack(side="left", padx=SPACING["sm"])
         ctk.CTkLabel(buttons, textvariable=self.status_var, anchor="w").pack(side="left", padx=SPACING["md"])
@@ -263,6 +264,8 @@ class SearchSavedScreen(BaseScreen):
         self._begin_query(self.model.search)
 
     def _clear(self) -> None:
+        if self._query_controller.running:
+            return
         for variable in self.filter_vars.values():
             variable.set("")
         self.model.clear_filters()
@@ -282,6 +285,7 @@ class SearchSavedScreen(BaseScreen):
             return
         self.status_var.set("Loading…")
         self.search_button.configure(state="disabled")
+        self.clear_button.configure(state="disabled")
         self._query_controller.start(action)
         self._query_job = self.after(30, self._poll_query)
 
@@ -293,6 +297,7 @@ class SearchSavedScreen(BaseScreen):
 
     def _finish_query(self) -> None:
         self.search_button.configure(state="normal")
+        self.clear_button.configure(state="normal")
         if self._query_controller.last_error is not None:
             self.status_var.set(str(self._query_controller.last_error))
             return

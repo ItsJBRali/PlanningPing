@@ -72,6 +72,7 @@ class PlanningPingApp(ctk.CTk):
         }
         for screen in self.screens.values():
             screen.grid(row=0, column=0, sticky="nsew")
+            screen.grid_remove()
         self.active_route = ""
         self.navigate("home")
         self.protocol("WM_DELETE_WINDOW", self.destroy)
@@ -81,10 +82,11 @@ class PlanningPingApp(ctk.CTk):
             raise ValueError(f"Unknown route: {route}")
         if self.active_route:
             self.screens[self.active_route].on_hide()
+            self.screens[self.active_route].grid_remove()
             self.navigation_buttons[self.active_route].configure(fg_color=COLORS["surface_raised"])
         self.active_route = route
         screen = self.screens[route]
-        screen.tkraise()
+        screen.grid()
         screen.on_show()
         self.navigation_buttons[route].configure(fg_color="#3A3A3A")
         self.top_title_var.set(self.TITLES[route])
