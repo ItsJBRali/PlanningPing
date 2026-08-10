@@ -64,14 +64,11 @@ class AtriumPlanningScraper(GenericLabelledPlanningScraper):
             **kwargs,
         )
         for application in discovery.applications:
-            date_inferred = not (application.date_received or application.date_validated)
-            if date_inferred and start_date:
-                application.date_validated = start_date.isoformat()
             application.raw = {
                 **(application.raw or {}),
-                "detail_complete": True,
+                "detail_complete": False,
                 "date_range_filtered": bool(start_date or end_date),
-                "date_inferred_from_search_window": date_inferred and start_date is not None,
+                "date_inferred_from_search_window": False,
             }
         return discovery
 

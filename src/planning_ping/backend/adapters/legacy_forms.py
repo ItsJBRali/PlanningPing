@@ -663,6 +663,43 @@ class CcedPlanningScraper(NativeListingScraper):
         document = html.fromstring(html_text)
         applications: list[PlanningApplication] = []
         seen: set[str] = set()
+        for container in document.xpath("//div[contains(concat(' ', normalize-space(@class), ' '), ' emphasise-area ')]"):
+            reference_links = container.xpath(".//h2/a[@href]")
+            if not reference_links:
+                continue
+            reference = clean_text(" ".join(reference_links[0].itertext()))
+            if not reference or reference in seen:
+                continue
+            seen.add(reference)
+            fields: dict[str, str] = {}
+            for heading in container.xpath("./h3"):
+                label = (clean_text(" ".join(heading.itertext())) or "").rstrip(":").casefold()
+                values = heading.xpath("following-sibling::*[1][self::p]")
+                value = clean_text(" ".join(values[0].itertext())) if values else None
+                if label and value:
+                    fields[label] = value
+            address = fields.get("location")
+            applications.append(
+                PlanningApplication(
+                    authority=self.authority,
+                    uid=reference,
+                    url=urljoin(page_url, reference_links[0].get("href") or ""),
+                    reference=reference,
+                    address=address,
+                    description=fields.get("proposal"),
+                    decision=fields.get("decision"),
+                    postcode=extract_postcode(address),
+                    source_url=page_url,
+                    raw={
+                        "portal_family": self.family,
+                        "detail_complete": False,
+                        "listing_text": clean_text(" ".join(container.itertext())),
+                    },
+                )
+            )
+        if applications:
+            return applications
+
         body_text = clean_text(" ".join(document.xpath("//body//text()"))) or ""
         pattern = re.compile(
             r"(?P<ref>P/[A-Z]+/\d{4}/\d+)\s+Location:\s*(?P<address>.*?)\s+Proposal:\s*(?P<proposal>.*?)\s+Decision:\s*(?P<decision>.*?)\s+Decision Date:\s*(?P<decision_date>.*?)(?:View this application|$)",

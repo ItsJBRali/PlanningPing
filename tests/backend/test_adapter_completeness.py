@@ -19,6 +19,7 @@ from planning_ping.backend.adapters.ocella import OcellaCouncilConfig, OcellaPla
 from planning_ping.backend.adapters.wiltshire import WiltshireCouncilConfig, WiltshirePlanningScraper
 from planning_ping.backend.adapters.bespoke_portals import ColchesterPlanningScraper, TelfordPlanningScraper
 from planning_ping.backend.adapters.legacy_forms import LegacyFormsCouncilConfig
+from planning_ping.backend.adapters.legacy_forms import CcedPlanningScraper
 from planning_ping.backend.http import BinaryFetchResponse, CouncilFetchError, CouncilHttpClient, FetchResponse, monitor_council_requests
 
 
@@ -46,6 +47,75 @@ class MappingHttp:
 
 
 class AdapterCompletenessTests(unittest.TestCase):
+    def test_atrium_listing_without_a_date_requires_detail_fetch_instead_of_inference(self) -> None:
+        listing = """
+        <div class="searchResultsCardRow">
+          <a href="/Planning/Display/P/26/03439/HOU">P/26/03439/HOU</a>
+          <span>23 Woodside Road Bournemouth BH5 2AZ</span>
+          <span>Proposed Single Storey Rear Extension</span>
+        </div>
+        """
+
+        class FixtureAtrium(AtriumPlanningScraper):
+            def _fetch_listing(self, *args: object, **kwargs: object) -> FetchResponse:
+                return FetchResponse("https://planning.example.test/Search/Results/1/100", 200, listing)
+
+        application = FixtureAtrium(
+            AtriumCouncilConfig("Example", "https://planning.example.test"),
+            http_client=MappingHttp(),
+        ).discover_ids(
+            listing_url="https://planning.example.test/Search/Advanced/",
+            start_date=date(2026, 8, 10),
+            end_date=date(2026, 8, 10),
+        ).applications[0]
+
+        self.assertIsNone(application.date_received)
+        self.assertIsNone(application.date_validated)
+        self.assertFalse(application.raw["detail_complete"])
+        self.assertFalse(application.raw.get("date_inferred_from_search_window", False))
+
+    def test_cced_results_preserve_the_portal_detail_href_and_record_boundaries(self) -> None:
+        listing = """
+        <html><body>
+          <div class="emphasise-area">
+            <h2><a href="plandisp.aspx?recno=430124">P/FUL/2026/03899</a></h2>
+            <h3>Location:</h3><p>Millers Dairy Farm</p>
+            <h3>Proposal:</h3><p>Change of use of agricultural buildings.</p>
+            <h3>Decision:</h3><p>Pending</p>
+            <h3>Decision Date:</h3><p></p>
+            <h3><a href="plandisp.aspx?recno=430124">View this application</a></h3>
+          </div>
+          <div class="emphasise-area">
+            <h2><a href="plandisp.aspx?recno=430246">P/CLE/2026/03997</a></h2>
+            <h3>Location:</h3><p>Emmers Farm</p>
+            <h3>Proposal:</h3><p>Vehicle repair workshop.</p>
+            <h3>Decision:</h3><p>Approved</p>
+            <h3>Decision Date:</h3><p>10 August 2026</p>
+            <h3><a href="plandisp.aspx?recno=430246">View this application</a></h3>
+          </div>
+        </body></html>
+        """
+        scraper = CcedPlanningScraper(
+            LegacyFormsCouncilConfig("Dorset", "https://planning.dorsetcouncil.gov.uk"),
+            http_client=MappingHttp(),
+        )
+
+        applications = scraper.parse_results(
+            listing,
+            "https://planning.dorsetcouncil.gov.uk/searchresults.aspx",
+        )
+
+        self.assertEqual(["P/FUL/2026/03899", "P/CLE/2026/03997"], [item.reference for item in applications])
+        self.assertEqual(
+            [
+                "https://planning.dorsetcouncil.gov.uk/plandisp.aspx?recno=430124",
+                "https://planning.dorsetcouncil.gov.uk/plandisp.aspx?recno=430246",
+            ],
+            [item.url for item in applications],
+        )
+        self.assertEqual("Change of use of agricultural buildings.", applications[0].description)
+        self.assertEqual("Pending", applications[0].decision)
+
     def test_modern_agile_api_uses_shared_binary_transport_and_honours_cancellation(self) -> None:
         class BinaryHttp:
             user_agent = "test-agent"

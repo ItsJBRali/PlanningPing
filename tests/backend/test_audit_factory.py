@@ -22,6 +22,21 @@ CHECKED_AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
 class CatalogueAuditTests(unittest.TestCase):
+    def test_nuneaton_catalogue_tracks_the_current_public_planning_portal(self) -> None:
+        nuneaton = next(
+            council
+            for council in AuthorityCatalogue.load().councils
+            if council.name == "Nuneaton and Bedworth Borough Council"
+        )
+
+        self.assertEqual("tascomi", nuneaton.portal_family)
+        self.assertEqual("Tascomi", nuneaton.scraper_type)
+        self.assertEqual("https://idoxcloud.nuneatonandbedworth.gov.uk", nuneaton.base_url)
+        self.assertEqual(
+            "https://idoxcloud.nuneatonandbedworth.gov.uk/planning/index.html?fa=search",
+            nuneaton.listing_url,
+        )
+
     def test_reports_duplicate_codes_bad_country_url_boundary_and_unmapped_family(self) -> None:
         councils = (
             Council("dup", "Alpha", "England", "idox", "Idox", "https://alpha.test", None, "https://alpha.test/search", BOUNDARY),
