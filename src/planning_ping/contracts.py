@@ -82,6 +82,10 @@ class ApplicationFilters:
     sort_direction: SortDirection = "desc"
 
     def __post_init__(self) -> None:
+        if type(self.page) is not int:
+            raise ValueError("page must be an integer")
+        if type(self.page_size) is not int:
+            raise ValueError("page_size must be an integer")
         if self.page < 1:
             raise ValueError("page must be at least 1")
         if not 1 <= self.page_size <= 500:

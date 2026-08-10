@@ -33,6 +33,17 @@ class ApplicationFiltersTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "page_size"):
             contracts.ApplicationFilters(page_size=501)
 
+    def test_rejects_fractional_and_boolean_pagination_values(self) -> None:
+        for field_name, value in (
+            ("page", 1.5),
+            ("page", True),
+            ("page_size", 10.5),
+            ("page_size", True),
+        ):
+            with self.subTest(field_name=field_name, value=value):
+                with self.assertRaisesRegex(ValueError, field_name):
+                    contracts.ApplicationFilters(**{field_name: value})
+
     def test_rejects_unknown_sort_field_and_direction(self) -> None:
         with self.assertRaisesRegex(ValueError, "sort_by"):
             contracts.ApplicationFilters(sort_by="postcode")
