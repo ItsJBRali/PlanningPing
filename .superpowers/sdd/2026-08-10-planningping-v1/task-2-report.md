@@ -152,3 +152,50 @@ Focused RED examples produced the expected failures: two production-boundary fai
 - Completeness/YAGNI: fixes are confined to the reviewed production boundaries and shared infrastructure; no UI, document payload, OCR, lead-output, or unrelated feature code was added.
 - Test realism: orchestration uses real SQLite transactions; host concurrency uses two real threads and independent HTTP clients; adapter tests exercise production parser/pagination methods with deterministic response doubles; real Arcus/Wiltshire types cover the detail-complete capability.
 - Remaining concern: exhaustive live council searches remain intentionally unrun. Real portal markup, availability, and certificates can change externally, so bounded opt-in live smoke remains an integration activity.
+
+## Review Fix Round 2
+
+Status: DONE. The remaining hostname/redirect/adaptive-throttling gap and inferred-date regression were reproduced and fixed with focused RED/GREEN cycles.
+
+### RED/GREEN evidence and dispositions
+
+#### A. Host normalization, redirects, and production adaptive limits — fixed
+
+- **Root causes:** the global host semaphore used `urlsplit(url).netloc`, so an implicit HTTPS port and `:443` created different gates; urllib followed redirects internally while only the original URL's gate was held; and the production search boundary did not assign a platform key to otherwise unkeyed adapter clients, leaving the standalone scheduler disconnected from those requests.
+- **RED:** default-port and explicit-port requests entered concurrently; a returned cross-host 302 never acquired the target-host gate; HTTP 429 did not reduce platform concurrency; two successes did not demonstrate capacity restoration; and an unkeyed production scraper remained unkeyed. All four focused tests failed for those expected reasons.
+- **GREEN:** hostname and rate-limit identities now use normalized `urlsplit(...).hostname`, independent of port. Automatic urllib redirects are disabled and followed manually with a ten-hop/repeat/scheme bound; each hop releases its source gate before acquiring the target hostname, preventing source/target lock inversion. Cross-host sensitive headers are not forwarded. A local two-server smoke also confirmed a real urllib 302 reaches the final response.
+- A process-wide adaptive platform gate now classifies rate-limited (429), blocked/auth (401/403 and WAF/CAPTCHA body), and service-unavailable (502/503/504) signals, reduces the affected platform to a minimum of one request, and restores one slot after two successful requests. All adapter HTTP traffic has an existing family key or receives one from `ProductionAuthoritySearcher` before network activity, so production uses the adaptive limit. The hostname/redirect/adaptive/production-key focused tests pass 4/4.
+
+#### B. Arcus/Wiltshire inferred request dates — fixed
+
+- **Root cause:** both Salesforce adapters copied `start_date` into received/validated when the portal record lacked a real date, then marked the synthetic value with `date_inferred_from_search_window=True`; this made an actually undated record pass the inclusive application-date filter.
+- **RED:** public discovery for both adapters normalized `2026-01-01` from the request into the application, and production accepted a deliberately inferred complete-discovery record. Both focused tests failed.
+- **GREEN:** neither adapter accepts or copies a fallback request date; missing portal dates remain `None`. Their detail-complete capability explicitly excludes inferred markers, and production independently raises `PortalSearchCompletenessError` if an inferred marker reaches the boundary. A genuinely undated complete record remains undated and `application_matches_request` rejects it. Adapter/production focused tests pass 2/2.
+
+### Round-2 files changed
+
+- `src/planning_ping/backend/http.py`
+- `src/planning_ping/backend/production.py`
+- `src/planning_ping/backend/adapters/arcus.py`
+- `src/planning_ping/backend/adapters/wiltshire.py`
+- `tests/backend/test_http_scheduler.py`
+- `tests/backend/test_production_search.py`
+- `tests/backend/test_adapter_completeness.py`
+
+### Fresh round-2 verification and audits
+
+- Full suite: `uv --system-certs run --link-mode copy --python 3.11 python -m unittest discover -s tests -v` — **69 tests, 0 failures**.
+- Focused HTTP/production/completeness modules — **28 tests, 0 failures**.
+- Compile: `uv --system-certs run --link-mode copy --python 3.11 python -m compileall -q src tools` — exit 0.
+- Offline catalogue audit — **399 rows, 399 pass, 0 fail**; no live council searches.
+- `git diff --check` — exit 0.
+- Security-evasion/TLS audit — 0 hits.
+- Document-payload-write audit — 0 hits.
+- Reusable source repository clean; no `src/planning_ping/ui/` changes; nothing pushed.
+
+### Round-2 self-review and concerns
+
+- Redirect handling is bounded, preserves POST bodies only for 307/308, converts 301/302/303 to GET, rejects unsupported/repeated targets, and strips credentials/cookies on hostname changes.
+- Adaptive limits remain deliberately small and process-local; they do not introduce a new persistence/configuration surface. Host concurrency remains one regardless of port or adapter family.
+- The full frozen contract literal tests remain green.
+- Remaining concern unchanged: exhaustive live council searches were intentionally not run; external portal behavior can change independently.

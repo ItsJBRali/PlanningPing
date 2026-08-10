@@ -54,7 +54,7 @@ class WiltshirePlanningScraper(PlanningScraper):
             end_date=end_date,
         )
         applications = [
-            self._application_from_record(record, listing_url, fallback_date=start_date)
+            self._application_from_record(record, listing_url)
             for record in records
         ]
         if limit is not None:
@@ -78,6 +78,7 @@ class WiltshirePlanningScraper(PlanningScraper):
         return (
             application.raw.get("detail_complete") is True
             and application.raw.get("date_range_filtered") is True
+            and application.raw.get("date_inferred_from_search_window") is not True
         )
 
     def _search_records(
@@ -157,8 +158,6 @@ class WiltshirePlanningScraper(PlanningScraper):
         self,
         record: dict[str, Any],
         listing_url: str,
-        *,
-        fallback_date: date | None,
     ) -> PlanningApplication:
         uid = clean_text(str(record.get("Id") or ""))
         reference = clean_text(str(record.get("Name") or ""))
@@ -176,10 +175,6 @@ class WiltshirePlanningScraper(PlanningScraper):
         validated = parse_council_date(
             clean_text(str(record.get("arcusbuiltenv__Valid_Date__c") or ""))
         )
-        date_inferred = False
-        if not validated and fallback_date:
-            validated = fallback_date.isoformat()
-            date_inferred = True
         parts = urlsplit(listing_url)
         path_prefix = self._path_prefix(parts.path)
         reference_slug = re.sub(r"[^a-z0-9]+", "", (reference or uid).casefold())
@@ -214,7 +209,7 @@ class WiltshirePlanningScraper(PlanningScraper):
                 "api": "PR_SearchCont.query",
                 "detail_complete": True,
                 "date_range_filtered": True,
-                "date_inferred_from_search_window": date_inferred,
+                "date_inferred_from_search_window": False,
                 "record": record,
             },
         )

@@ -16,6 +16,7 @@ from planning_ping.backend.adapters.base import PortalSearchCompletenessError
 from planning_ping.backend.adapters.idox import IdoxCouncilConfig, IdoxPublicAccessScraper
 from planning_ping.backend.adapters.northgate import NorthgateCouncilConfig, NorthgatePlanningScraper
 from planning_ping.backend.adapters.ocella import OcellaCouncilConfig, OcellaPlanningScraper
+from planning_ping.backend.adapters.wiltshire import WiltshireCouncilConfig, WiltshirePlanningScraper
 from planning_ping.backend.adapters.bespoke_portals import ColchesterPlanningScraper
 from planning_ping.backend.adapters.legacy_forms import LegacyFormsCouncilConfig
 from planning_ping.backend.http import FetchResponse
@@ -161,6 +162,47 @@ class AdapterCompletenessTests(unittest.TestCase):
                 start_date=date(2026, 1, 1),
                 end_date=date(2026, 1, 1),
             )
+
+    def test_arcus_and_wiltshire_never_normalize_the_requested_start_as_an_application_date(self) -> None:
+        class UndatedArcus(ArcusPlanningScraper):
+            def _aura_context(self, html_text: str) -> dict[str, object]:
+                return {}
+
+            def _search_records(self, *args: object, **kwargs: object) -> list[dict[str, object]]:
+                return [{"Id": "UID1", "Name": "24/0001"}]
+
+        class UndatedWiltshire(WiltshirePlanningScraper):
+            def _aura_context(self, html_text: str) -> dict[str, object]:
+                return {}
+
+            def _search_records(self, *args: object, **kwargs: object) -> list[dict[str, object]]:
+                return [{"Id": "UID2", "Name": "24/0002"}]
+
+        arcus = UndatedArcus(
+            ArcusCouncilConfig("Example", "https://planning.example.test"),
+            http_client=MappingHttp(),
+        )
+        wiltshire_scraper = UndatedWiltshire(
+            WiltshireCouncilConfig("Example", "https://planning.example.test"),
+            http_client=MappingHttp(),
+        )
+        requested_start = date(2026, 1, 1)
+
+        arcus_application = arcus.discover_ids(
+            listing_url="https://planning.example.test/s/register-view",
+            start_date=requested_start,
+            end_date=date(2026, 1, 31),
+        ).applications[0]
+        wiltshire_application = wiltshire_scraper.discover_ids(
+            listing_url="https://planning.example.test/s/register-view",
+            start_date=requested_start,
+            end_date=date(2026, 1, 31),
+        ).applications[0]
+
+        self.assertIsNone(arcus_application.date_received)
+        self.assertIsNone(wiltshire_application.date_validated)
+        self.assertFalse(arcus_application.raw["date_inferred_from_search_window"])
+        self.assertFalse(wiltshire_application.raw["date_inferred_from_search_window"])
 
     def test_agile_and_power_pages_fixed_bounds_raise_instead_of_truncating(self) -> None:
         agile_links = "".join(

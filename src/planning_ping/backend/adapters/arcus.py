@@ -54,7 +54,7 @@ class ArcusPlanningScraper(PlanningScraper):
             start_date=start_date,
             end_date=end_date,
         )
-        applications = [self._application_from_record(record, listing_url, fallback_date=start_date) for record in records]
+        applications = [self._application_from_record(record, listing_url) for record in records]
         if limit is not None:
             applications = applications[:limit]
         return DiscoveryResult(authority=self.authority, source_url=listing_url, applications=applications)
@@ -72,6 +72,7 @@ class ArcusPlanningScraper(PlanningScraper):
         return (
             application.raw.get("detail_complete") is True
             and application.raw.get("date_range_filtered") is True
+            and application.raw.get("date_inferred_from_search_window") is not True
         )
 
     def _search_records(
@@ -257,8 +258,6 @@ class ArcusPlanningScraper(PlanningScraper):
         self,
         record: dict[str, Any],
         listing_url: str,
-        *,
-        fallback_date: date | None = None,
     ) -> PlanningApplication:
         uid = clean_text(str(record.get("Id") or ""))
         reference = clean_text(str(record.get("Name") or ""))
@@ -276,10 +275,6 @@ class ArcusPlanningScraper(PlanningScraper):
             "Date_Received__c",
         )
         parsed_received = parse_council_date(received)
-        date_inferred = False
-        if not parsed_received and fallback_date:
-            parsed_received = fallback_date.isoformat()
-            date_inferred = True
         parts = urlsplit(listing_url)
         path_prefix = self._path_prefix(parts.path)
         url = urlunsplit((parts.scheme, parts.netloc, f"{path_prefix}/s/detail/{uid}", "", ""))
@@ -299,7 +294,7 @@ class ArcusPlanningScraper(PlanningScraper):
                 "api": "arcus_pr_search",
                 "detail_complete": True,
                 "date_range_filtered": True,
-                "date_inferred_from_search_window": date_inferred,
+                "date_inferred_from_search_window": False,
                 "record": record,
             },
         )

@@ -166,6 +166,12 @@ class ProductionAuthoritySearcher:
         cancel_event: Event,
     ) -> AuthoritySearchResult:
         scraper = self._scraper_factory(council)
+        client = getattr(scraper, "http", None)
+        if isinstance(client, CouncilHttpClient) and not client.concurrency_key:
+            platform = council.portal_family.casefold().strip()
+            if platform in {"", "custom", "unknown"}:
+                platform = council.scraper_type.casefold().strip() or "custom"
+            client.concurrency_key = f"portal:{platform}"
         try:
             with monitor_council_requests(lambda: None, should_cancel=cancel_event.is_set):
                 discovery = scraper.discover_ids(
@@ -177,6 +183,10 @@ class ProductionAuthoritySearcher:
                 for discovered in discovery.applications:
                     if cancel_event.is_set():
                         raise RuntimeError(f"Search cancelled while fetching details for {council.name}")
+                    if discovered.raw.get("date_inferred_from_search_window") is True:
+                        raise PortalSearchCompletenessError(
+                            f"{council.name} returned an inferred request date instead of an application date"
+                        )
                     if scraper.discovery_is_detail_complete(discovered):
                         complete = discovered
                     else:

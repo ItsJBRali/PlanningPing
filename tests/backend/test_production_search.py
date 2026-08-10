@@ -15,6 +15,8 @@ from planning_ping.backend.adapters.arcus import ArcusCouncilConfig, ArcusPlanni
 from planning_ping.backend.adapters.idox import IdoxPublicAccessScraper
 from planning_ping.backend.adapters.wiltshire import WiltshireCouncilConfig, WiltshirePlanningScraper
 from planning_ping.backend.http import FetchResponse
+from planning_ping.backend.http import CouncilHttpClient
+from planning_ping.backend.filtering import application_matches_request
 from planning_ping.backend.geometry import location_match_quality
 from planning_ping.backend.models import Council
 from planning_ping.backend.production import ProductionAuthoritySearcher, UnsupportedPortalError, scraper_for_council
@@ -206,6 +208,63 @@ class ProductionAuthoritySearchTests(unittest.TestCase):
             ProductionAuthoritySearcher(scraper_factory=lambda _: IgnoredDateRangeScraper()).search_primary(
                 council(), date(2026, 1, 1), date(2026, 1, 31), Event()
             )
+
+    def test_production_assigns_an_adaptive_platform_key_to_unkeyed_http_clients(self) -> None:
+        scraper = FakeScraper()
+        scraper.http = CouncilHttpClient(min_delay_seconds=0)
+
+        ProductionAuthoritySearcher(scraper_factory=lambda _: scraper).search_primary(
+            council(), date(2026, 1, 1), date(2026, 1, 31), Event()
+        )
+
+        self.assertEqual("portal:idox", scraper.http.concurrency_key)
+
+    def test_inferred_request_dates_are_rejected_and_undated_records_do_not_match(self) -> None:
+        inferred = AdapterApplication(
+            "Alpha",
+            "UID1",
+            "https://alpha.test/UID1",
+            reference="24/A",
+            description="Rear extension",
+            address="1 High Street EX1 1AA",
+            date_received="2026-01-01",
+            raw={
+                "detail_complete": True,
+                "date_range_filtered": True,
+                "date_inferred_from_search_window": True,
+            },
+        )
+
+        class InferredDiscoveryScraper(DetailCompleteDiscoveryScraper):
+            def discover_ids(self, **kwargs: object) -> DiscoveryResult:
+                return DiscoveryResult("Alpha", "https://alpha.test/search", [inferred])
+
+        with self.assertRaisesRegex(PortalSearchCompletenessError, "inferred"):
+            ProductionAuthoritySearcher(scraper_factory=lambda _: InferredDiscoveryScraper()).search_primary(
+                council(), date(2026, 1, 1), date(2026, 1, 31), Event()
+            )
+
+        undated = AdapterApplication(
+            "Alpha",
+            "UID2",
+            "https://alpha.test/UID2",
+            reference="24/B",
+            description="Rear extension",
+            address="1 High Street EX1 1AA",
+            raw={"detail_complete": True, "date_range_filtered": True},
+        )
+
+        class UndatedDiscoveryScraper(DetailCompleteDiscoveryScraper):
+            def discover_ids(self, **kwargs: object) -> DiscoveryResult:
+                return DiscoveryResult("Alpha", "https://alpha.test/search", [undated])
+
+        result = ProductionAuthoritySearcher(scraper_factory=lambda _: UndatedDiscoveryScraper()).search_primary(
+            council(), date(2026, 1, 1), date(2026, 1, 31), Event()
+        )
+        self.assertIsNone(result.applications[0].application_date)
+        self.assertFalse(
+            application_matches_request(result.applications[0], date(2026, 1, 1), date(2026, 1, 31), ())
+        )
 
     def test_planit_rejects_repeated_pages_and_reported_total_mismatches(self) -> None:
         repeated = {"total": 2, "records": [{"uid": "24/A", "name": "24/A", "start_date": "2026-01-05"}]}

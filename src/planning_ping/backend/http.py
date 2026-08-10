@@ -15,6 +15,7 @@ from urllib.parse import urlencode, urljoin, urlsplit
 from urllib.request import (
     HTTPCookieProcessor,
     HTTPSHandler,
+    HTTPRedirectHandler,
     Request,
     build_opener,
 )
@@ -72,6 +73,61 @@ class _RawFetchResponse:
 
 _REQUEST_MONITOR = threading.local()
 _BROWSER_FALLBACK_GATE = threading.BoundedSemaphore(1)
+_REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
+_MAX_REDIRECTS = 10
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
+class _AdaptiveConcurrencyGate:
+    def __init__(self, limit: int, *, recovery_successes: int = 2) -> None:
+        self._base_limit = max(limit, 1)
+        self._current_limit = self._base_limit
+        self._recovery_successes = max(recovery_successes, 1)
+        self._successes = 0
+        self._active = 0
+        self._condition = threading.Condition()
+
+    def restrict_to(self, limit: int) -> None:
+        with self._condition:
+            self._base_limit = min(self._base_limit, max(limit, 1))
+            self._current_limit = min(self._current_limit, self._base_limit)
+            self._condition.notify_all()
+
+    def acquire(self) -> None:
+        with self._condition:
+            while self._active >= self._current_limit:
+                _raise_if_request_cancelled()
+                self._condition.wait(timeout=0.25)
+            self._active += 1
+
+    def release(self, signal: str) -> None:
+        with self._condition:
+            self._active = max(self._active - 1, 0)
+            self._apply_signal(signal)
+            self._condition.notify_all()
+
+    def record(self, signal: str) -> None:
+        with self._condition:
+            self._apply_signal(signal)
+            self._condition.notify_all()
+
+    def _apply_signal(self, signal: str) -> None:
+        if signal in {"rate_limited", "blocked", "service_unavailable"}:
+            self._current_limit = max(self._current_limit - 1, 1)
+            self._successes = 0
+            return
+        if signal != "success" or self._current_limit >= self._base_limit:
+            if signal != "success":
+                self._successes = 0
+            return
+        self._successes += 1
+        if self._successes >= self._recovery_successes:
+            self._current_limit += 1
+            self._successes = 0
 
 
 @contextmanager
@@ -131,7 +187,7 @@ class CouncilHttpClient:
     _concurrency_lock = threading.Lock()
     _shared_last_request_at: dict[str, float] = {}
     _blocked_until: dict[str, float] = {}
-    _concurrency_gates: dict[tuple[str, int], threading.BoundedSemaphore] = {}
+    _concurrency_gates: dict[str, _AdaptiveConcurrencyGate] = {}
     _hostname_gates: dict[str, threading.BoundedSemaphore] = {}
 
     def __init__(
@@ -254,6 +310,7 @@ class CouncilHttpClient:
         body = response.body.decode(response.charset, errors="replace")
         blocked_reason = _blocked_page_reason(body, "")
         if blocked_reason:
+            self._record_platform_signal("blocked")
             raise CouncilFetchError(f"{blocked_reason} while fetching {url}")
         return FetchResponse(
             url=response.url,
@@ -267,36 +324,23 @@ class CouncilHttpClient:
             _raise_if_request_cancelled()
             _report_request_activity()
             try:
-                with self._request_slot(url):
-                    _raise_if_request_cancelled()
-                    self._wait_for_turn(url)
-                    _raise_if_request_cancelled()
-                    _report_request_activity()
-                    with self._opener().open(request, timeout=self.timeout_seconds) as response:
-                        charset = response.headers.get_content_charset() or "utf-8"
-                        body = response.read()
-                        status_code = getattr(response, "status", 200)
-                        response_url = response.geturl()
+                response = self._open_redirect_chain(request, url)
                 _report_request_activity()
-                if not body.strip():
+                if not response.body.strip():
                     last_error = CouncilFetchError(f"Empty response while fetching {url}")
                     if attempt == self.retries:
                         raise last_error
                     self._pause_before_retry(url, attempt, minimum_seconds=3.0)
                     continue
-                return _RawFetchResponse(
-                    url=response_url,
-                    status_code=status_code,
-                    body=body,
-                    charset=charset,
-                )
+                return response
             except HTTPError as exc:
+                failure_url = str(getattr(exc, "url", None) or url)
                 if exc.code in {429, 503} and attempt < self.retries:
                     last_error = exc
-                    self._pause_before_retry(url, attempt, exc=exc)
+                    self._pause_before_retry(failure_url, attempt, exc=exc)
                     continue
                 if exc.code < 500 or attempt == self.retries:
-                    raise CouncilFetchError(f"HTTP {exc.code} while fetching {url}") from exc
+                    raise CouncilFetchError(f"HTTP {exc.code} while fetching {failure_url}") from exc
                 last_error = exc
             except URLError as exc:
                 if _is_tls_certificate_error(exc):
@@ -310,6 +354,54 @@ class CouncilHttpClient:
             self._pause_before_retry(url, attempt, minimum_seconds=0.5 * (attempt + 1))
 
         raise CouncilFetchError(f"Could not fetch {url}") from last_error
+
+    def _open_redirect_chain(self, request: Request, url: str) -> _RawFetchResponse:
+        current_request = request
+        current_url = url
+        visited = {url}
+        for _redirect_count in range(_MAX_REDIRECTS + 1):
+            redirect_error: HTTPError | None = None
+            try:
+                with self._request_slot(current_url):
+                    _raise_if_request_cancelled()
+                    self._wait_for_turn(current_url)
+                    _raise_if_request_cancelled()
+                    _report_request_activity()
+                    with self._opener().open(current_request, timeout=self.timeout_seconds) as response:
+                        charset = response.headers.get_content_charset() or "utf-8"
+                        body = response.read()
+                        status_code = int(getattr(response, "status", 200))
+                        response_url = response.geturl()
+                        response_headers = response.headers
+            except HTTPError as exc:
+                if exc.code not in _REDIRECT_STATUS_CODES:
+                    raise
+                redirect_error = exc
+                status_code = exc.code
+                response_url = str(exc.geturl() or current_url)
+                response_headers = exc.headers
+                exc.close()
+
+            if status_code not in _REDIRECT_STATUS_CODES:
+                return _RawFetchResponse(
+                    url=response_url,
+                    status_code=status_code,
+                    body=body,
+                    charset=charset,
+                )
+
+            location = response_headers.get("Location") if response_headers else None
+            if not location:
+                raise CouncilFetchError(f"Redirect response from {current_url} did not include a target") from redirect_error
+            target_url = urljoin(response_url or current_url, str(location))
+            if target_url in visited:
+                raise CouncilFetchError(f"Repeated redirect target while fetching {url}: {target_url}")
+            if urlsplit(target_url).scheme.casefold() not in {"http", "https"}:
+                raise CouncilFetchError(f"Unsupported redirect target while fetching {url}: {target_url}")
+            visited.add(target_url)
+            current_request = _redirected_request(current_request, target_url, status_code)
+            current_url = target_url
+        raise CouncilFetchError(f"Too many redirects while fetching {url}")
 
     def _wait_for_turn(self, url: str) -> None:
         key = self._throttle_key(url)
@@ -344,14 +436,14 @@ class CouncilHttpClient:
         if self.rate_limit_key:
             return self.rate_limit_key
         source = url or ""
-        return urlsplit(source).netloc.casefold() or self.configured_host_key()
+        return _hostname_key(source) or self.configured_host_key()
 
     def configured_host_key(self) -> str:
         return f"client:{id(self)}"
 
     @contextmanager
     def _request_slot(self, url: str):
-        hostname = urlsplit(url).netloc.casefold()
+        hostname = _hostname_key(url) or self.configured_host_key()
         with self._concurrency_lock:
             host_gate = self._hostname_gates.get(hostname)
             if host_gate is None:
@@ -359,17 +451,37 @@ class CouncilHttpClient:
                 self._hostname_gates[hostname] = host_gate
             platform_gate = None
             if self.concurrency_key:
-                gate_key = (self.concurrency_key, self.concurrency_limit)
+                gate_key = self.concurrency_key.casefold()
                 platform_gate = self._concurrency_gates.get(gate_key)
                 if platform_gate is None:
-                    platform_gate = threading.BoundedSemaphore(self.concurrency_limit)
+                    platform_gate = _AdaptiveConcurrencyGate(self.concurrency_limit)
                     self._concurrency_gates[gate_key] = platform_gate
+                else:
+                    platform_gate.restrict_to(self.concurrency_limit)
         with self._cancellable_request_slot(host_gate):
             if platform_gate is None:
                 yield
             else:
-                with self._cancellable_request_slot(platform_gate):
+                platform_gate.acquire()
+                signal = "success"
+                try:
                     yield
+                except HTTPError as exc:
+                    signal = _platform_signal_for_http_status(exc.code)
+                    raise
+                except (CouncilFetchError, URLError):
+                    signal = "error"
+                    raise
+                finally:
+                    platform_gate.release(signal)
+
+    def _record_platform_signal(self, signal: str) -> None:
+        if not self.concurrency_key:
+            return
+        with self._concurrency_lock:
+            gate = self._concurrency_gates.get(self.concurrency_key.casefold())
+        if gate is not None:
+            gate.record(signal)
 
     @contextmanager
     def _cancellable_request_slot(self, gate):
@@ -387,7 +499,7 @@ class CouncilHttpClient:
         return ssl.create_default_context(cafile=cafile)
 
     def _opener(self):
-        handlers = [HTTPCookieProcessor(self._cookies)]
+        handlers = [_NoRedirectHandler(), HTTPCookieProcessor(self._cookies)]
         context = self._ssl_context()
         if context is not None:
             handlers.append(HTTPSHandler(context=context))
@@ -632,6 +744,47 @@ def browser_fallback_recommended(exc: Exception) -> bool:
             "northgate date search was not accepted",
         )
     )
+
+
+def _hostname_key(url: str) -> str:
+    hostname = urlsplit(url).hostname
+    return hostname.casefold() if hostname else ""
+
+
+def _platform_signal_for_http_status(status_code: int) -> str:
+    if status_code == 429:
+        return "rate_limited"
+    if status_code in {401, 403}:
+        return "blocked"
+    if status_code in {502, 503, 504}:
+        return "service_unavailable"
+    return "error"
+
+
+def _redirected_request(request: Request, target_url: str, status_code: int) -> Request:
+    method = request.get_method()
+    data = request.data
+    if status_code in {301, 302, 303} and method != "HEAD":
+        method = "GET"
+        data = None
+
+    source_hostname = _hostname_key(request.full_url)
+    target_hostname = _hostname_key(target_url)
+    headers: dict[str, str] = {}
+    for key, value in request.header_items():
+        lowered = key.casefold()
+        if lowered == "host":
+            continue
+        if data is None and lowered in {"content-length", "content-type", "transfer-encoding"}:
+            continue
+        if source_hostname != target_hostname and lowered in {
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+        }:
+            continue
+        headers[key] = value
+    return Request(target_url, data=data, headers=headers, method=method)
 
 
 def _retry_delay_seconds(exc: HTTPError, attempt: int) -> float:
