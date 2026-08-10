@@ -39,12 +39,6 @@ except ImportError:  # pragma: no cover - optional outside the packaged GUI
     selenium_conditions = None
     WebDriverWait = None
 
-try:
-    import certifi
-except ImportError:  # pragma: no cover - depends on the runtime environment
-    certifi = None
-
-
 class CouncilFetchError(RuntimeError):
     """Raised when a council page cannot be fetched."""
 
@@ -493,10 +487,9 @@ class CouncilHttpClient:
             gate.release()
 
     def _ssl_context(self) -> ssl.SSLContext | None:
-        if not self.ca_file and certifi is None:
-            return None
-        cafile = self.ca_file or certifi.where()
-        return ssl.create_default_context(cafile=cafile)
+        if self.ca_file is not None:
+            return ssl.create_default_context(cafile=self.ca_file)
+        return ssl.create_default_context()
 
     def _opener(self):
         handlers = [_NoRedirectHandler(), HTTPCookieProcessor(self._cookies)]

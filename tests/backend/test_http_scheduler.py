@@ -53,6 +53,25 @@ class FakeResponse:
 
 
 class HttpBoundaryTests(unittest.TestCase):
+    def test_ssl_context_uses_system_trust_unless_an_explicit_ca_file_is_supplied(self) -> None:
+        system_context = object()
+        explicit_context = object()
+        with mock.patch.object(
+            planning_http.ssl,
+            "create_default_context",
+            side_effect=(system_context, explicit_context),
+        ) as create_context:
+            self.assertIs(system_context, CouncilHttpClient()._ssl_context())
+            self.assertIs(
+                explicit_context,
+                CouncilHttpClient(ca_file="C:/certificates/council-ca.pem")._ssl_context(),
+            )
+
+        self.assertEqual(
+            [mock.call(), mock.call(cafile="C:/certificates/council-ca.pem")],
+            create_context.call_args_list,
+        )
+
     def test_retries_empty_responses_with_a_bound_and_rejects_waf_challenges(self) -> None:
         class Opener:
             def __init__(self) -> None:
