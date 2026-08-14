@@ -85,7 +85,7 @@ class SearchNewScreen(BaseScreen):
         self.drop_target.drop_target_register(DND_FILES)
         self.drop_target.dnd_bind("<<Drop>>", self._on_drop)
         FocusButton(form, text="Browse", width=100, command=self._browse).grid(row=0, column=2, padx=SPACING["md"])
-        ctk.CTkLabel(form, textvariable=self.boundary_error_var, text_color=COLORS["error"], anchor="w").grid(
+        ctk.CTkLabel(form, textvariable=self.boundary_error_var, text_color=COLORS["error"], font=TYPE["body_strong"], anchor="w").grid(
             row=1, column=1, columnspan=2, sticky="ew", padx=SPACING["sm"]
         )
         self.date_entries = []
@@ -95,12 +95,12 @@ class SearchNewScreen(BaseScreen):
             entry.grid(row=row, column=1, sticky="ew", padx=SPACING["sm"], pady=SPACING["sm"])
             self.date_entries.append(entry)
         self.start_entry, self.end_entry = self.date_entries
-        self.date_error_label = ctk.CTkLabel(form, textvariable=self.date_error_var, text_color=COLORS["error"], anchor="w")
+        self.date_error_label = ctk.CTkLabel(form, textvariable=self.date_error_var, text_color=COLORS["error"], font=TYPE["body_strong"], anchor="w")
         self.date_error_label.grid(row=4, column=1, columnspan=2, sticky="ew", padx=SPACING["sm"])
         ctk.CTkLabel(form, text="Exclusion phrases", anchor="nw").grid(row=5, column=0, sticky="nw", padx=SPACING["md"], pady=SPACING["sm"])
         self.phrases = ctk.CTkTextbox(form, height=100)
         self.phrases.grid(row=5, column=1, columnspan=2, sticky="ew", padx=SPACING["sm"], pady=SPACING["sm"])
-        self.error_label = ctk.CTkLabel(form, textvariable=self.error_var, text_color=COLORS["error"], anchor="w")
+        self.error_label = ctk.CTkLabel(form, textvariable=self.error_var, text_color=COLORS["error"], font=TYPE["body_strong"], anchor="w")
         self.error_label.grid(row=6, column=0, columnspan=3, sticky="ew", padx=SPACING["md"])
         actions = ctk.CTkFrame(form, fg_color="transparent")
         actions.grid(row=7, column=0, columnspan=3, sticky="ew", padx=SPACING["md"], pady=SPACING["md"])
