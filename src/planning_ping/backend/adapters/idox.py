@@ -9,9 +9,11 @@ from lxml import html
 
 from planning_ping.backend.adapters.base import PlanningScraper, PortalSearchCompletenessError
 from planning_ping.backend.http import (
+    CouncilAccessBlockedError,
     CouncilBrowserClient,
     CouncilFetchError,
     CouncilHttpClient,
+    CouncilRateLimitError,
     FetchResponse,
     browser_fallback_recommended,
 )
@@ -85,6 +87,8 @@ class IdoxPublicAccessScraper(PlanningScraper):
         if listing_url and (start_date or end_date):
             try:
                 response = self._fetch_advanced_search(listing_url, start_date=start_date, end_date=end_date)
+            except (CouncilRateLimitError, CouncilAccessBlockedError):
+                raise
             except CouncilFetchError:
                 if not self._is_complete_week_range(start_date, end_date):
                     raise

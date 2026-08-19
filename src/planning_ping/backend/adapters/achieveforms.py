@@ -12,7 +12,12 @@ from urllib.parse import parse_qs, quote, urlencode, urljoin, urlsplit, urlunspl
 from lxml import etree
 
 from planning_ping.backend.adapters.base import PlanningScraper
-from planning_ping.backend.http import CouncilFetchError, CouncilHttpClient
+from planning_ping.backend.http import (
+    CouncilAccessBlockedError,
+    CouncilFetchError,
+    CouncilHttpClient,
+    CouncilRateLimitError,
+)
 from planning_ping.backend.adapter_models import DiscoveryResult, PlanningApplication, PlanningDocument
 from planning_ping.backend.parsing import clean_text, extract_postcode, parse_council_date
 
@@ -72,6 +77,8 @@ class AchieveFormsPlanningScraper(PlanningScraper):
             seen.add(reference)
             try:
                 application = self._fetch_application_with_metadata(reference, metadata)
+            except (CouncilRateLimitError, CouncilAccessBlockedError):
+                raise
             except Exception:
                 application = self._stub_from_weekly_row(row, metadata)
             application_date = self._application_date(application)

@@ -44,6 +44,7 @@ class CouncilPhaseScheduler:
 
     def __init__(self) -> None:
         self._ready: deque[CouncilPhaseTask] = deque()
+        self._prompt_followups: deque[CouncilPhaseTask] = deque()
         self._deferred: list[tuple[float, int, CouncilPhaseTask]] = []
         self._sequence = count()
         self._active_councils: set[str] = set()
@@ -53,6 +54,9 @@ class CouncilPhaseScheduler:
     def enqueue(self, task: CouncilPhaseTask) -> None:
         self._ready.append(task)
 
+    def enqueue_followup(self, task: CouncilPhaseTask) -> None:
+        self._prompt_followups.append(task)
+
     def defer(self, task: CouncilPhaseTask, *, ready_at: float) -> None:
         heapq.heappush(self._deferred, (ready_at, next(self._sequence), task))
 
@@ -61,12 +65,13 @@ class CouncilPhaseScheduler:
 
     def acquire(self, *, now: float) -> CouncilPhaseTask | None:
         self._promote_due(now)
-        for _candidate in range(len(self._ready)):
-            task = self._ready.popleft()
-            if self._eligible(task, now):
-                self._activate(task)
-                return task
-            self._ready.append(task)
+        for queue in (self._prompt_followups, self._ready):
+            for _candidate in range(len(queue)):
+                task = queue.popleft()
+                if self._eligible(task, now):
+                    self._activate(task)
+                    return task
+                queue.append(task)
         return None
 
     def release(self, task: CouncilPhaseTask) -> None:
@@ -75,7 +80,7 @@ class CouncilPhaseScheduler:
             self._planit_active = False
 
     def has_pending(self) -> bool:
-        return bool(self._ready or self._deferred)
+        return bool(self._prompt_followups or self._ready or self._deferred)
 
     def next_ready_at(self, *, now: float) -> float | None:
         deadlines = [
@@ -85,7 +90,7 @@ class CouncilPhaseScheduler:
         ]
         deadlines.extend(
             ready_at
-            for task in self._ready
+            for task in (*self._prompt_followups, *self._ready)
             if (ready_at := self._scope_cooldowns.get(task.scope, 0.0)) > now
         )
         return min(deadlines, default=None)
@@ -93,7 +98,10 @@ class CouncilPhaseScheduler:
     def _promote_due(self, now: float) -> None:
         while self._deferred and self._deferred[0][0] <= now:
             _ready_at, _sequence, task = heapq.heappop(self._deferred)
-            self._ready.append(task)
+            if task.phase == "planit":
+                self._prompt_followups.append(task)
+            else:
+                self._ready.append(task)
 
     def _eligible(self, task: CouncilPhaseTask, now: float) -> bool:
         return (

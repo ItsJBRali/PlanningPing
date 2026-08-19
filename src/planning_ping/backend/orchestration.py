@@ -431,7 +431,7 @@ class PlanningSearchService:
         total: int,
     ) -> None:
         if task.phase == "primary":
-            scheduler.enqueue(
+            scheduler.enqueue_followup(
                 CouncilPhaseTask(
                     council_code=task.council_code,
                     phase="planit",
@@ -540,7 +540,7 @@ class PlanningSearchService:
         counters: _RunCounters,
     ) -> SearchSummary:
         for state in states:
-            if state.saved or state.started_at is None or state.deferred_phase is not None:
+            if state.saved or state.deferred_phase is not None:
                 continue
             primary_items = state.primary.applications if state.primary else ()
             planit_items = state.planit.applications if state.planit else ()

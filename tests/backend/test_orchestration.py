@@ -412,6 +412,100 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(expected_codes, searcher.primary_calls)
         self.assertEqual(expected_codes, searcher.planit_calls)
 
+    def test_unlocked_planit_is_saved_before_untouched_primary_backlog_drains(self) -> None:
+        councils = [make_council(f"council-{index}") for index in range(10)]
+
+        class BacklogBlockingSearcher:
+            def __init__(self) -> None:
+                self.lock = Lock()
+                self.primary_started = {
+                    council.code: Event() for council in councils
+                }
+                self.release_first = Event()
+                self.release_others = Event()
+                self.first_planit_started = Event()
+                self.events: list[str] = []
+
+            def search_primary(self, council, start_date, end_date, cancel_event):
+                with self.lock:
+                    self.events.append(f"primary:{council.code}")
+                self.primary_started[council.code].set()
+                if council.code == "council-0":
+                    self.release_first.wait()
+                    return AuthoritySearchResult(
+                        (make_application("council-0", "C0/1"),)
+                    )
+                self.release_others.wait()
+                return AuthoritySearchResult()
+
+            def search_planit(self, council, start_date, end_date, cancel_event):
+                with self.lock:
+                    self.events.append(f"planit:{council.code}")
+                if council.code == "council-0":
+                    self.first_planit_started.set()
+                return AuthoritySearchResult()
+
+        searcher = BacklogBlockingSearcher()
+        service = PlanningSearchService(
+            self.database,
+            AuthorityCatalogue(councils),
+            searcher,
+            clock=lambda: NOW,
+        )
+        first_saved = Event()
+        errors: list[BaseException] = []
+        summaries: list[object] = []
+        original_save = self.database.save_council_result
+
+        def recording_save(run_id, council, applications, **kwargs):
+            result = original_save(run_id, council, applications, **kwargs)
+            with searcher.lock:
+                searcher.events.append(f"save:{council.code}")
+            if council.code == "council-0":
+                first_saved.set()
+            return result
+
+        def run_search() -> None:
+            try:
+                summaries.append(service.run(self.request, lambda event: None, Event()))
+            except BaseException as error:
+                errors.append(error)
+
+        self.database.save_council_result = recording_save
+        search_thread = Thread(target=run_search)
+        search_thread.start()
+        try:
+            for index in range(8):
+                self.assertTrue(searcher.primary_started[f"council-{index}"].wait(2))
+            self.assertFalse(searcher.primary_started["council-8"].is_set())
+            self.assertFalse(searcher.primary_started["council-9"].is_set())
+
+            searcher.release_first.set()
+            self.assertTrue(
+                searcher.first_planit_started.wait(2),
+                "the early council's PlanIt phase starved behind untouched primaries",
+            )
+            self.assertTrue(
+                first_saved.wait(2),
+                "the early council was not saved promptly after PlanIt completed",
+            )
+            self.assertTrue(searcher.primary_started["council-8"].wait(2))
+            self.assertFalse(searcher.primary_started["council-9"].is_set())
+            with searcher.lock:
+                observed_before_backlog_release = tuple(searcher.events)
+        finally:
+            searcher.release_first.set()
+            searcher.release_others.set()
+            search_thread.join(4)
+            self.database.save_council_result = original_save
+
+        self.assertIn("planit:council-0", observed_before_backlog_release)
+        self.assertIn("save:council-0", observed_before_backlog_release)
+        self.assertNotIn("primary:council-9", observed_before_backlog_release)
+        self.assertFalse(search_thread.is_alive())
+        self.assertEqual([], errors)
+        self.assertEqual(1, len(summaries))
+
     def test_finished_council_is_saved_immediately_on_the_coordinator_thread(self) -> None:
         councils = [make_council("alpha"), make_council("beta")]
         searcher = SplitCompletionSearcher()
@@ -1158,6 +1252,7 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual("cancelled", summary.status)
         self.assertEqual((1, 0, 0), (summary.searched_councils, summary.empty_councils, summary.failed_councils))
         self.assertEqual(1, [event.kind for event in events].count("council_finished"))
+        self.assertNotIn(("primary", "gamma"), searcher.calls)
         self.assertEqual({"alpha": "success", "beta": "cancelled", "gamma": "cancelled"}, outcomes)
 
     def test_council_outcome_started_at_is_the_primary_phase_start(self) -> None:

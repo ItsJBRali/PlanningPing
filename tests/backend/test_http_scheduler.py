@@ -196,6 +196,46 @@ class HttpBoundaryTests(unittest.TestCase):
         self.assertEqual("access_denied", raised.exception.category)
         self.assertIn("HTTP 403", str(raised.exception))
 
+    def test_403_checking_not_a_bot_page_is_safely_classified_without_body_exposure(self) -> None:
+        body = (
+            b"<html><h1>Checking you're not a bot</h1>"
+            b"<p>private-block-page-reference-8472</p></html>"
+        )
+
+        class BlockedOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, request: object, timeout: float) -> FakeResponse:
+                self.calls += 1
+                raise HTTPError(
+                    "https://planning.test/search",
+                    403,
+                    "Forbidden",
+                    MappingHeaders({}),
+                    io.BytesIO(body),
+                )
+
+        class Client(CouncilHttpClient):
+            def __init__(self) -> None:
+                super().__init__(min_delay_seconds=0, retries=6)
+                self.opener = BlockedOpener()
+
+            def _opener(self) -> BlockedOpener:
+                return self.opener
+
+        client = Client()
+        with self.assertRaises(CouncilAccessBlockedError) as raised:
+            client.get("https://planning.test/search")
+
+        self.assertEqual(1, client.opener.calls)
+        self.assertEqual("portal_security", raised.exception.category)
+        self.assertEqual(
+            "Web application firewall challenge detected",
+            raised.exception.reason,
+        )
+        self.assertNotIn("private-block-page-reference", str(raised.exception))
+
     def test_ssl_context_uses_system_trust_unless_an_explicit_ca_file_is_supplied(self) -> None:
         system_context = object()
         explicit_context = object()
@@ -633,6 +673,24 @@ class HttpBoundaryTests(unittest.TestCase):
             with self.subTest(message=message):
                 self.assertFalse(browser_fallback_recommended(CouncilFetchError(message)))
 
+    def test_browser_rejects_checking_not_a_bot_page_without_exposing_body(self) -> None:
+        class FakeDriver:
+            page_source = (
+                "<html><h1>Checking you're not a bot</h1>"
+                "<p>private-browser-block-reference-5921</p></html>"
+            )
+            title = "One more step"
+            current_url = "https://planning.test/search"
+
+        browser = CouncilBrowserClient()
+        browser._driver = FakeDriver()
+
+        with self.assertRaises(CouncilFetchError) as raised:
+            browser._raise_for_error_page()
+
+        self.assertIn("Web application firewall challenge detected", str(raised.exception))
+        self.assertNotIn("private-browser-block-reference", str(raised.exception))
+
 
 class SchedulerBoundaryTests(unittest.TestCase):
     def test_primary_scopes_are_stable_and_fallback_backoff_is_bounded(self) -> None:
@@ -692,6 +750,30 @@ class SchedulerBoundaryTests(unittest.TestCase):
         scheduler.release(alpha_planit)
         self.assertIsNone(scheduler.acquire(now=29.0))
         self.assertEqual(alpha_primary, scheduler.acquire(now=30.0))
+
+    def test_prompt_followups_are_fifo_and_do_not_block_primary_progress_during_planit_single_flight(self) -> None:
+        scheduler = CouncilPhaseScheduler()
+        alpha_primary = CouncilPhaseTask("alpha", "primary", "portal:idox")
+        beta_primary = CouncilPhaseTask("beta", "primary", "portal:idox")
+        gamma_primary = CouncilPhaseTask("gamma", "primary", "portal:idox")
+        alpha_planit = CouncilPhaseTask("alpha", "planit", PLANIT_RATE_LIMIT_SCOPE)
+        beta_planit = CouncilPhaseTask("beta", "planit", PLANIT_RATE_LIMIT_SCOPE)
+        for task in (alpha_primary, beta_primary, gamma_primary):
+            scheduler.enqueue(task)
+
+        self.assertEqual(alpha_primary, scheduler.acquire(now=0.0))
+        scheduler.release(alpha_primary)
+        scheduler.enqueue_followup(alpha_planit)
+        self.assertEqual(alpha_planit, scheduler.acquire(now=0.0))
+
+        self.assertEqual(beta_primary, scheduler.acquire(now=0.0))
+        scheduler.release(beta_primary)
+        scheduler.enqueue_followup(beta_planit)
+        self.assertEqual(gamma_primary, scheduler.acquire(now=0.0))
+        scheduler.release(gamma_primary)
+
+        scheduler.release(alpha_planit)
+        self.assertEqual(beta_planit, scheduler.acquire(now=0.0))
 
     def test_allows_one_active_request_per_host_and_adapts_after_rate_limiting(self) -> None:
         scheduler = PlatformAwareScheduler[str](platform_limits={"idox": 2}, default_platform_limit=1, host_limit=1, rate_limit_cooldown_seconds=0)

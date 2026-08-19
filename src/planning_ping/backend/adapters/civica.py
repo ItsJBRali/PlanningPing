@@ -10,7 +10,11 @@ from planning_ping.backend.adapters.generic import (
     GenericCouncilConfig,
     GenericLabelledPlanningScraper,
 )
-from planning_ping.backend.http import CouncilHttpClient
+from planning_ping.backend.http import (
+    CouncilAccessBlockedError,
+    CouncilHttpClient,
+    CouncilRateLimitError,
+)
 from planning_ping.backend.adapter_models import DiscoveryResult, PlanningApplication, PlanningDocument
 from planning_ping.backend.parsing import clean_text, extract_postcode, parse_council_date
 
@@ -179,6 +183,8 @@ class CivicaPlanningScraper(GenericLabelledPlanningScraper):
         try:
             response = self.http.get(urljoin(api_url, f"keyobject/getsearchcriteria/{quote(ref_type)}?format=json"))
             criteria = json.loads(response.text)
+        except (CouncilRateLimitError, CouncilAccessBlockedError):
+            raise
         except Exception:
             return ("SDate5From", "SDate5To")
         pairs: dict[str, dict[str, str]] = {}

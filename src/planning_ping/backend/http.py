@@ -897,6 +897,7 @@ def _access_block_classification(text: str, title: str) -> tuple[str, str]:
         "incapsula incident id",
         "captcha-sdk.awswaf.com",
         "awswaf",
+        "checking you're not a bot",
         "cf-chl-",
         "cloudflare ray id",
         "azure waf",

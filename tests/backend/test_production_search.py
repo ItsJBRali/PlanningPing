@@ -14,7 +14,12 @@ from planning_ping.backend.adapters.base import PortalSearchCompletenessError
 from planning_ping.backend.adapters.arcus import ArcusCouncilConfig, ArcusPlanningScraper
 from planning_ping.backend.adapters.idox import IdoxPublicAccessScraper
 from planning_ping.backend.adapters.wiltshire import WiltshireCouncilConfig, WiltshirePlanningScraper
-from planning_ping.backend.http import CouncilHttpClient, CouncilRateLimitError, FetchResponse
+from planning_ping.backend.http import (
+    CouncilAccessBlockedError,
+    CouncilHttpClient,
+    CouncilRateLimitError,
+    FetchResponse,
+)
 from planning_ping.backend.filtering import application_matches_request
 from planning_ping.backend.geometry import location_match_quality
 from planning_ping.backend.models import Council
@@ -31,6 +36,7 @@ def council(family: str = "idox", scraper_type: str = "Idox") -> Council:
 class FakeScraper:
     def __init__(self) -> None:
         self.fetches: list[tuple[str, str | None, bool]] = []
+        self.closed = False
 
     def discover_ids(self, **kwargs: object) -> DiscoveryResult:
         return DiscoveryResult(
@@ -65,7 +71,7 @@ class FakeScraper:
         return False
 
     def close(self) -> None:
-        pass
+        self.closed = True
 
 
 class DetailCompleteDiscoveryScraper(FakeScraper):
@@ -294,33 +300,56 @@ class ProductionAuthoritySearchTests(unittest.TestCase):
         self.assertEqual("portal:idox", scraper.http.concurrency_key)
         self.assertEqual("portal:idox", scraper.http.rate_limit_key)
 
-    def test_production_search_preserves_structured_rate_limit_failures(self) -> None:
-        primary_error = CouncilRateLimitError(
-            url="https://alpha.test/search",
-            scope="portal:idox",
-            retry_after_seconds=60.0,
-            retry_limit=6,
-        )
+    def test_production_search_preserves_structured_failures_and_closes_primary_scrapers(self) -> None:
+        class FailingScraper(FakeScraper):
+            def __init__(self, error: Exception) -> None:
+                super().__init__()
+                self.error = error
 
-        class RateLimitedScraper(FakeScraper):
             def discover_ids(self, **kwargs: object) -> DiscoveryResult:
-                raise primary_error
+                raise self.error
 
-        with self.assertRaises(CouncilRateLimitError) as primary_raised:
-            ProductionAuthoritySearcher(
-                scraper_factory=lambda _council: RateLimitedScraper()
-            ).search_primary(council(), date(2026, 1, 1), date(2026, 1, 31), Event())
-        self.assertIs(primary_error, primary_raised.exception)
+        class FailingPlanIt:
+            def __init__(self, error: Exception) -> None:
+                self.error = error
 
-        class RateLimitedPlanIt:
             def get(self, url: str, params: dict[str, str] | None = None) -> FetchResponse:
-                raise primary_error
+                raise self.error
 
-        with self.assertRaises(CouncilRateLimitError) as planit_raised:
-            ProductionAuthoritySearcher(planit_http=RateLimitedPlanIt()).search_planit(
-                council(), date(2026, 1, 1), date(2026, 1, 31), Event()
-            )
-        self.assertIs(primary_error, planit_raised.exception)
+        errors = (
+            CouncilRateLimitError(
+                url="https://alpha.test/search",
+                scope="portal:idox",
+                retry_after_seconds=60.0,
+                retry_limit=6,
+            ),
+            CouncilAccessBlockedError(
+                url="https://alpha.test/search",
+                category="portal_security",
+                reason="Web application firewall challenge detected",
+            ),
+        )
+        for error in errors:
+            with self.subTest(direction="primary", error=type(error).__name__):
+                scraper = FailingScraper(error)
+                with self.assertRaises(type(error)) as primary_raised:
+                    ProductionAuthoritySearcher(
+                        scraper_factory=lambda _council, value=scraper: value
+                    ).search_primary(
+                        council(),
+                        date(2026, 1, 1),
+                        date(2026, 1, 31),
+                        Event(),
+                    )
+                self.assertIs(error, primary_raised.exception)
+                self.assertTrue(scraper.closed)
+
+            with self.subTest(direction="planit", error=type(error).__name__):
+                with self.assertRaises(type(error)) as planit_raised:
+                    ProductionAuthoritySearcher(planit_http=FailingPlanIt(error)).search_planit(
+                        council(), date(2026, 1, 1), date(2026, 1, 31), Event()
+                    )
+                self.assertIs(error, planit_raised.exception)
 
     def test_inferred_request_dates_are_rejected_and_undated_records_do_not_match(self) -> None:
         inferred = AdapterApplication(
