@@ -5,6 +5,7 @@ from http.cookiejar import CookieJar
 from dataclasses import dataclass
 from contextlib import contextmanager
 import json
+import math
 import re
 import ssl
 import threading
@@ -840,7 +841,8 @@ def _retry_after_seconds(exc: HTTPError, *, now: datetime | None = None) -> floa
     if retry_after is None:
         return None
     try:
-        return max(float(retry_after), 0.0)
+        seconds = float(retry_after)
+        return max(seconds, 0.0) if math.isfinite(seconds) else None
     except (TypeError, ValueError, OverflowError):
         try:
             retry_time = parsedate_to_datetime(str(retry_after))

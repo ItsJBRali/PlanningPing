@@ -109,6 +109,18 @@ class HttpBoundaryTests(unittest.TestCase):
 
         self.assertEqual(300.0, planning_http._retry_after_seconds(error, now=now))
 
+    def test_non_finite_retry_after_values_are_invalid(self) -> None:
+        for value in ("NaN", "Infinity"):
+            with self.subTest(value=value):
+                error = HTTPError(
+                    "https://planning.test",
+                    429,
+                    "Too Many Requests",
+                    MappingHeaders({"Retry-After": value}),
+                    io.BytesIO(),
+                )
+                self.assertIsNone(planning_http._retry_after_seconds(error))
+
     def test_403_classifies_local_content_filter_and_never_retries(self) -> None:
         body = (
             b"<title>Content filtering has stopped access to this web page</title>"
