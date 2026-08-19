@@ -70,6 +70,23 @@ class SearchControllerTests(unittest.TestCase):
         self.assertEqual(controller.state.status_message, "Search cancelled")
         self.assertTrue(controller.state.search_enabled)
 
+    def test_council_started_uses_coordinator_status_message_when_present(self) -> None:
+        controller = SearchController(FakeSearchService(summary()), lambda state: None)
+        controller._apply_event(
+            SearchEvent(
+                "council_started",
+                council="Alpha",
+                completed=1,
+                total=3,
+                message="Alpha paused by PlanIt rate limit; retrying in 294 seconds",
+            )
+        )
+
+        self.assertEqual(
+            "Alpha paused by PlanIt rate limit; retrying in 294 seconds",
+            controller.state.status_message,
+        )
+
     def test_a_running_search_cannot_create_a_duplicate_worker(self) -> None:
         service = FakeSearchService(summary("cancelled"), wait_for_cancel=True)
         controller = SearchController(service, lambda state: None)

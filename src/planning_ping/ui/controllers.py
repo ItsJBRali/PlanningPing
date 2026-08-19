@@ -126,11 +126,12 @@ class SearchController:
         if event.kind == "started":
             changes.update(status_message="Search running", total_councils=event.total)
         elif event.kind == "council_started":
+            status_message = event.message or f"Searching {event.council or 'council'}…"
             changes.update(
                 current_council=event.council or "",
                 completed_councils=event.completed,
                 total_councils=event.total,
-                status_message=f"Searching {event.council or 'council'}…",
+                status_message=status_message,
             )
         elif event.kind == "council_finished":
             changes.update(completed_councils=event.completed, total_councils=event.total)

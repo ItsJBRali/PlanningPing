@@ -7,6 +7,7 @@ import random
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+from math import ceil
 from threading import Event
 from time import monotonic
 from typing import Callable, Iterable, Protocol
@@ -16,9 +17,14 @@ from planning_ping.contracts import SearchEvent, SearchRequest, SearchSummary
 from .catalogue import AuthorityCatalogue
 from .filtering import application_matches_request, reconcile_applications
 from .geometry import load_geojson, location_match_quality, validate_geojson
+from .http import CouncilRateLimitError
 from .models import Council, PlanningApplication
 from .persistence import PlanningDatabase
-from .rate_limits import PLANIT_RATE_LIMIT_SCOPE, primary_rate_limit_scope
+from .rate_limits import (
+    PLANIT_RATE_LIMIT_SCOPE,
+    fallback_retry_delay,
+    primary_rate_limit_scope,
+)
 from .scheduler import CouncilPhaseScheduler, CouncilPhaseTask
 
 
@@ -59,6 +65,7 @@ class _CouncilState:
     primary_error: Exception | None = None
     planit_error: Exception | None = None
     rate_limit_attempts: dict[str, int] = field(default_factory=dict)
+    deferred_phase: str | None = None
     saved: bool = False
 
 
@@ -264,6 +271,21 @@ class PlanningSearchService:
                         total=total,
                     )
                 )
+            if state.deferred_phase == task.phase:
+                emit(
+                    SearchEvent(
+                        kind="council_started",
+                        run_id=run_id,
+                        council=state.council.name,
+                        completed=completed,
+                        total=total,
+                        message=(
+                            f"Retrying {self._phase_label(task.phase)} for "
+                            f"{state.council.name}"
+                        ),
+                    )
+                )
+                state.deferred_phase = None
             future = executor.submit(self._run_phase, task, state, request, cancel_event)
             in_flight[future] = task
 
@@ -275,16 +297,23 @@ class PlanningSearchService:
     ) -> set[Future[AuthoritySearchResult]]:
         now = self._monotonic_clock()
         next_ready_at = scheduler.next_ready_at(now=now)
-        timeout = None if next_ready_at is None else max(next_ready_at - now, 0.0)
+        deadline_timeout = (
+            None if next_ready_at is None else max(next_ready_at - now, 0.0)
+        )
         if futures:
+            timeout = (
+                0.25
+                if deadline_timeout is None
+                else min(0.25, deadline_timeout)
+            )
             completed, _pending = wait(
                 futures,
                 timeout=timeout,
                 return_when=FIRST_COMPLETED,
             )
             return completed
-        if timeout is not None:
-            cancel_event.wait(timeout)
+        if deadline_timeout is not None:
+            cancel_event.wait(deadline_timeout)
         return set()
 
     def _handle_phase_result(
@@ -303,11 +332,51 @@ class PlanningSearchService:
         state = states[task.council_code]
         try:
             result = future.result()
+        except CouncilRateLimitError as error:
+            attempt = state.rate_limit_attempts.get(task.phase, 0) + 1
+            state.rate_limit_attempts[task.phase] = attempt
+            if attempt > error.retry_limit:
+                self._record_phase_error(state, task.phase, error)
+                self._queue_next_or_finalize(
+                    task,
+                    state,
+                    scheduler,
+                    request,
+                    uploaded_geometries,
+                    emit,
+                    run_id,
+                    counters,
+                    len(states),
+                )
+                return
+
+            delay = (
+                error.retry_after_seconds
+                if error.retry_after_seconds is not None
+                else fallback_retry_delay(attempt, self._jitter)
+            )
+            ready_at = self._monotonic_clock() + max(delay, 0.0)
+            scheduler.set_scope_cooldown(error.scope, ready_at=ready_at)
+            scheduler.defer(task, ready_at=ready_at)
+            state.deferred_phase = task.phase
+            emit(
+                SearchEvent(
+                    kind="council_started",
+                    run_id=run_id,
+                    council=state.council.name,
+                    completed=counters.completed,
+                    total=len(states),
+                    saved_count=counters.saved,
+                    message=(
+                        f"{state.council.name} paused by "
+                        f"{self._phase_label(task.phase)} rate limit; "
+                        f"retrying in {ceil(delay)} seconds"
+                    ),
+                )
+            )
+            return
         except Exception as error:
-            if task.phase == "primary":
-                state.primary_error = error
-            else:
-                state.planit_error = error
+            self._record_phase_error(state, task.phase, error)
         else:
             if task.phase == "primary":
                 state.primary = result
@@ -316,6 +385,41 @@ class PlanningSearchService:
 
         if cancel_event.is_set():
             return
+        self._queue_next_or_finalize(
+            task,
+            state,
+            scheduler,
+            request,
+            uploaded_geometries,
+            emit,
+            run_id,
+            counters,
+            len(states),
+        )
+
+    @staticmethod
+    def _record_phase_error(
+        state: _CouncilState,
+        phase: str,
+        error: Exception,
+    ) -> None:
+        if phase == "primary":
+            state.primary_error = error
+        else:
+            state.planit_error = error
+
+    def _queue_next_or_finalize(
+        self,
+        task: CouncilPhaseTask,
+        state: _CouncilState,
+        scheduler: CouncilPhaseScheduler,
+        request: SearchRequest,
+        uploaded_geometries: list[dict[str, object]],
+        emit: Callable[[SearchEvent], None],
+        run_id: int,
+        counters: _RunCounters,
+        total: int,
+    ) -> None:
         if task.phase == "primary":
             scheduler.enqueue(
                 CouncilPhaseTask(
@@ -332,8 +436,12 @@ class PlanningSearchService:
             emit,
             run_id,
             counters,
-            len(states),
+            total,
         )
+
+    @staticmethod
+    def _phase_label(phase: str) -> str:
+        return "Primary portal" if phase == "primary" else "PlanIt"
 
     def _finalize_council(
         self,
