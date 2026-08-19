@@ -333,6 +333,9 @@ class PlanningSearchService:
         try:
             result = future.result()
         except CouncilRateLimitError as error:
+            if cancel_event.is_set():
+                self._record_phase_error(state, task.phase, error)
+                return
             attempt = state.rate_limit_attempts.get(task.phase, 0) + 1
             state.rate_limit_attempts[task.phase] = attempt
             retry_limit = (
@@ -535,7 +538,7 @@ class PlanningSearchService:
         counters: _RunCounters,
     ) -> SearchSummary:
         for state in states:
-            if state.saved or state.started_at is None:
+            if state.saved or state.started_at is None or state.deferred_phase is not None:
                 continue
             primary_items = state.primary.applications if state.primary else ()
             planit_items = state.planit.applications if state.planit else ()

@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from planning_ping.contracts import SearchRequest
 from planning_ping.backend.catalogue import AuthorityCatalogue
-from planning_ping.backend.http import CouncilRateLimitError
+from planning_ping.backend.http import CouncilAccessBlockedError, CouncilRateLimitError
 from planning_ping.backend.models import Council, PlanningApplication
 from planning_ping.backend.orchestration import AuthoritySearchResult, PlanningSearchService
 from planning_ping.backend.persistence import PlanningDatabase
@@ -303,6 +303,72 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(2, kinds.count("warning"))
         progress = [event.completed for event in events if event.completed is not None]
         self.assertEqual(sorted(progress), progress)
+
+    def test_primary_access_block_falls_back_to_planit_and_saves_warning(self) -> None:
+        access_block = CouncilAccessBlockedError(
+            url="https://alpha.test/search",
+            category="network_filter",
+            reason="Local network content filter blocked this council portal",
+        )
+        searcher = FakeAuthoritySearcher(
+            primary={"alpha": access_block},
+            planit={"alpha": [make_application("alpha", "A1")]},
+        )
+        events = []
+        service = PlanningSearchService(
+            self.database,
+            AuthorityCatalogue([self.councils[0]]),
+            searcher,
+            clock=lambda: NOW,
+        )
+
+        summary = service.run(self.request, events.append, Event())
+
+        self.assertEqual("completed_with_issues", summary.status)
+        self.assertEqual(0, summary.failed_councils)
+        self.assertEqual(["A1"], [row[0] for row in self.database.connection.execute("SELECT reference FROM applications")])
+        outcome = self.database.connection.execute(
+            "SELECT outcome_status, exception_message FROM council_search_outcomes"
+        ).fetchone()
+        self.assertEqual("warning", outcome[0])
+        self.assertIn("local network content filter", outcome[1].casefold())
+        warnings = [event.message for event in events if event.kind == "warning"]
+        self.assertEqual(1, len(warnings))
+        self.assertIn("local network content filter", warnings[0].casefold())
+        self.assertEqual([("primary", "alpha"), ("planit", "alpha")], searcher.calls)
+
+    def test_planit_access_block_retains_primary_result_as_warning(self) -> None:
+        access_block = CouncilAccessBlockedError(
+            url="https://www.planit.org.uk/api/applics/json",
+            category="network_filter",
+            reason="Local network content filter blocked this council portal",
+        )
+        searcher = FakeAuthoritySearcher(
+            primary={"alpha": [make_application("alpha", "A1")]},
+            planit={"alpha": access_block},
+        )
+        events = []
+        service = PlanningSearchService(
+            self.database,
+            AuthorityCatalogue([self.councils[0]]),
+            searcher,
+            clock=lambda: NOW,
+        )
+
+        summary = service.run(self.request, events.append, Event())
+
+        self.assertEqual("completed_with_issues", summary.status)
+        self.assertEqual(0, summary.failed_councils)
+        self.assertEqual(["A1"], [row[0] for row in self.database.connection.execute("SELECT reference FROM applications")])
+        outcome = self.database.connection.execute(
+            "SELECT outcome_status, exception_message FROM council_search_outcomes"
+        ).fetchone()
+        self.assertEqual("warning", outcome[0])
+        self.assertIn("local network content filter", outcome[1].casefold())
+        warnings = [event.message for event in events if event.kind == "warning"]
+        self.assertEqual(1, len(warnings))
+        self.assertIn("local network content filter", warnings[0].casefold())
+        self.assertEqual([("primary", "alpha"), ("planit", "alpha")], searcher.calls)
 
     def test_searches_at_most_eight_councils_concurrently_and_planit_is_single_flight(self) -> None:
         councils = [make_council(f"council-{index}") for index in range(10)]
@@ -674,6 +740,175 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(1, len(results))
         self.assertEqual("cancelled", results[0].status)
         self.assertEqual(1, searcher.planit_calls)
+
+    def test_cancellation_drains_active_work_once_and_leaves_deferred_retry_unsaved(self) -> None:
+        class ActiveAndDeferredSearcher:
+            def __init__(self) -> None:
+                self.primary_calls: list[str] = []
+                self.planit_calls: list[str] = []
+
+            def search_primary(self, council, start_date, end_date, cancel_event):
+                self.primary_calls.append(council.code)
+                if council.code == "beta":
+                    cancel_event.wait(2)
+                    return AuthoritySearchResult((make_application("beta", "B1"),))
+                if council.code == "gamma":
+                    raise CouncilRateLimitError(
+                        url="https://gamma.test/search",
+                        scope="portal:idox",
+                        retry_after_seconds=300.0,
+                        retry_limit=2,
+                    )
+                return AuthoritySearchResult((make_application("alpha", "A1"),))
+
+            def search_planit(self, council, start_date, end_date, cancel_event):
+                self.planit_calls.append(council.code)
+                return AuthoritySearchResult()
+
+        cancel_event = Event()
+        searcher = ActiveAndDeferredSearcher()
+        service = PlanningSearchService(
+            self.database,
+            AuthorityCatalogue(self.councils),
+            searcher,
+            clock=lambda: NOW,
+            worker_limit=3,
+            monotonic_clock=lambda: 100.0,
+        )
+        events = []
+        alpha_finished = False
+        gamma_deferred = False
+        saved_codes: list[str] = []
+        original_save = self.database.save_council_result
+
+        def recording_save(run_id, council, applications, **kwargs):
+            saved_codes.append(council.code)
+            return original_save(run_id, council, applications, **kwargs)
+
+        def observed_emit(event) -> None:
+            nonlocal alpha_finished, gamma_deferred
+            events.append(event)
+            alpha_finished = alpha_finished or (
+                event.kind == "council_finished" and event.council == "Alpha Council"
+            )
+            gamma_deferred = gamma_deferred or (
+                event.kind == "council_started"
+                and event.council == "Gamma Council"
+                and event.message is not None
+                and "paused by Primary portal rate limit" in event.message
+            )
+            if alpha_finished and gamma_deferred:
+                cancel_event.set()
+
+        self.database.save_council_result = recording_save
+        try:
+            summary = service.run(self.request, observed_emit, cancel_event)
+        finally:
+            self.database.save_council_result = original_save
+            cancel_event.set()
+
+        self.assertEqual("cancelled", summary.status)
+        self.assertEqual(1, saved_codes.count("alpha"))
+        self.assertLessEqual(saved_codes.count("beta"), 1)
+        self.assertNotIn("gamma", saved_codes)
+        self.assertEqual(
+            "success",
+            self.database.connection.execute(
+                "SELECT o.outcome_status FROM council_search_outcomes o "
+                "JOIN councils c ON c.id=o.council_id WHERE c.code='alpha'"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            sum(
+                event.kind == "council_finished" and event.council == "Alpha Council"
+                for event in events
+            ),
+        )
+        self.assertEqual(1, searcher.primary_calls.count("gamma"))
+        self.assertNotIn("gamma", searcher.planit_calls)
+        terminal = self.database.connection.execute(
+            "SELECT status, finished_at FROM search_runs"
+        ).fetchone()
+        self.assertEqual("cancelled", terminal[0])
+        self.assertIsNotNone(terminal[1])
+
+    def test_cancellation_retains_primary_data_when_active_planit_returns_rate_limit(self) -> None:
+        class CancelledRateLimitedPlanItSearcher:
+            def __init__(self) -> None:
+                self.planit_started = Event()
+                self.release_planit = Event()
+                self.planit_calls = 0
+
+            def search_primary(self, council, start_date, end_date, cancel_event):
+                return AuthoritySearchResult((make_application("alpha", "A1"),))
+
+            def search_planit(self, council, start_date, end_date, cancel_event):
+                self.planit_calls += 1
+                self.planit_started.set()
+                self.release_planit.wait(2)
+                raise CouncilRateLimitError(
+                    url="https://www.planit.org.uk/api/applics/json",
+                    scope="planit",
+                    retry_after_seconds=300.0,
+                    retry_limit=2,
+                )
+
+        cancel_event = Event()
+        searcher = CancelledRateLimitedPlanItSearcher()
+        service = PlanningSearchService(
+            self.database,
+            AuthorityCatalogue([self.councils[0]]),
+            searcher,
+            clock=lambda: NOW,
+        )
+        saved_codes: list[str] = []
+        summaries = []
+        errors: list[BaseException] = []
+        original_save = self.database.save_council_result
+
+        def recording_save(run_id, council, applications, **kwargs):
+            saved_codes.append(council.code)
+            return original_save(run_id, council, applications, **kwargs)
+
+        def run_search() -> None:
+            try:
+                summaries.append(service.run(self.request, lambda event: None, cancel_event))
+            except BaseException as error:
+                errors.append(error)
+
+        self.database.save_council_result = recording_save
+        search_thread = Thread(target=run_search)
+        search_thread.start()
+        try:
+            self.assertTrue(searcher.planit_started.wait(2))
+            cancel_event.set()
+            searcher.release_planit.set()
+            search_thread.join(2)
+        finally:
+            cancel_event.set()
+            searcher.release_planit.set()
+            search_thread.join(2)
+            self.database.save_council_result = original_save
+
+        self.assertFalse(search_thread.is_alive())
+        self.assertEqual([], errors)
+        self.assertEqual(1, len(summaries))
+        self.assertEqual("cancelled", summaries[0].status)
+        self.assertEqual(1, summaries[0].saved_applications)
+        self.assertEqual(["alpha"], saved_codes)
+        self.assertEqual(1, searcher.planit_calls)
+        self.assertEqual(
+            ("cancelled", "A1"),
+            tuple(
+                self.database.connection.execute(
+                    "SELECT o.outcome_status, a.reference "
+                    "FROM council_search_outcomes o "
+                    "JOIN search_run_applications sra ON sra.run_id=o.run_id "
+                    "JOIN applications a ON a.id=sra.application_id"
+                ).fetchone()
+            ),
+        )
 
     def test_primary_rate_limit_retries_only_primary_and_saves_once(self) -> None:
         class RetriedPrimarySearcher:
