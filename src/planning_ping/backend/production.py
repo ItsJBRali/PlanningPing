@@ -48,6 +48,7 @@ from .http import CouncilHttpClient, monitor_council_requests
 from .models import ApplicationDocument, Council, PlanningApplication
 from .orchestration import AuthoritySearchResult
 from .parsing import parse_council_date
+from .rate_limits import primary_rate_limit_scope
 
 
 class UnsupportedPortalError(RuntimeError):
@@ -166,12 +167,12 @@ class ProductionAuthoritySearcher:
         cancel_event: Event,
     ) -> AuthoritySearchResult:
         scraper = self._scraper_factory(council)
+        scope = primary_rate_limit_scope(council)
         client = getattr(scraper, "http", None)
-        if isinstance(client, CouncilHttpClient) and not client.concurrency_key:
-            platform = council.portal_family.casefold().strip()
-            if platform in {"", "custom", "unknown"}:
-                platform = council.scraper_type.casefold().strip() or "custom"
-            client.concurrency_key = f"portal:{platform}"
+        if isinstance(client, CouncilHttpClient):
+            client.rate_limit_key = scope
+            if not client.concurrency_key:
+                client.concurrency_key = scope
         try:
             with monitor_council_requests(lambda: None, should_cancel=cancel_event.is_set):
                 discovery = scraper.discover_ids(
