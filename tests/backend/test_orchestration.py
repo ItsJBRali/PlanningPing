@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from datetime import date, datetime, timezone
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock, Thread, get_ident
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
@@ -44,10 +44,12 @@ class FakeAuthoritySearcher:
         self.primary = primary
         self.planit = planit
         self.cancel = cancel
+        self.lock = Lock()
         self.calls: list[tuple[str, str]] = []
 
     def search_primary(self, council: Council, start_date: date, end_date: date, cancel_event: Event) -> AuthoritySearchResult:
-        self.calls.append(("primary", council.code))
+        with self.lock:
+            self.calls.append(("primary", council.code))
         result = self.primary[council.code]
         if isinstance(result, Exception):
             raise result
@@ -56,7 +58,8 @@ class FakeAuthoritySearcher:
         return AuthoritySearchResult(tuple(result))
 
     def search_planit(self, council: Council, start_date: date, end_date: date, cancel_event: Event) -> AuthoritySearchResult:
-        self.calls.append(("planit", council.code))
+        with self.lock:
+            self.calls.append(("planit", council.code))
         result = self.planit[council.code]
         if isinstance(result, Exception):
             raise result
@@ -66,10 +69,81 @@ class FakeAuthoritySearcher:
 class PlanItCancellingSearcher(FakeAuthoritySearcher):
     def search_planit(self, council: Council, start_date: date, end_date: date, cancel_event: Event) -> AuthoritySearchResult:
         if council.code == "beta":
-            self.calls.append(("planit", council.code))
+            with self.lock:
+                self.calls.append(("planit", council.code))
             cancel_event.set()
             raise RuntimeError("cancelled during PlanIt")
         return super().search_planit(council, start_date, end_date, cancel_event)
+
+
+class BlockingConcurrentSearcher:
+    def __init__(self) -> None:
+        self.lock = Lock()
+        self.release_primary = Event()
+        self.eight_started = Event()
+        self.active_councils: set[str] = set()
+        self.max_active = 0
+        self.duplicate_council = False
+        self.primary_calls: set[str] = set()
+        self.planit_calls: set[str] = set()
+        self.planit_active = 0
+        self.max_planit_active = 0
+        self.first_planit_started = Event()
+        self.planit_overlap = Event()
+        self.release_planit = Event()
+
+    def search_primary(self, council, start_date, end_date, cancel_event):
+        with self.lock:
+            if council.code in self.active_councils:
+                self.duplicate_council = True
+            self.active_councils.add(council.code)
+            self.primary_calls.add(council.code)
+            self.max_active = max(self.max_active, len(self.active_councils))
+            if len(self.active_councils) == 8:
+                self.eight_started.set()
+        self.release_primary.wait(2)
+        with self.lock:
+            self.active_councils.remove(council.code)
+        return AuthoritySearchResult()
+
+    def search_planit(self, council, start_date, end_date, cancel_event):
+        with self.lock:
+            if council.code in self.active_councils:
+                self.duplicate_council = True
+            self.active_councils.add(council.code)
+            self.planit_calls.add(council.code)
+            self.planit_active += 1
+            self.max_planit_active = max(self.max_planit_active, self.planit_active)
+            self.first_planit_started.set()
+            if self.planit_active > 1:
+                self.planit_overlap.set()
+        self.release_planit.wait(2)
+        with self.lock:
+            self.planit_active -= 1
+            self.active_councils.remove(council.code)
+        return AuthoritySearchResult()
+
+
+class SplitCompletionSearcher:
+    def __init__(self) -> None:
+        self.lock = Lock()
+        self.beta_entered = Event()
+        self.release_beta = Event()
+        self.network_thread_ids: set[int] = set()
+
+    def search_primary(self, council, start_date, end_date, cancel_event):
+        with self.lock:
+            self.network_thread_ids.add(get_ident())
+        if council.code == "beta":
+            self.beta_entered.set()
+            self.release_beta.wait(2)
+        applications = (make_application("alpha", "A1"),) if council.code == "alpha" else ()
+        return AuthoritySearchResult(applications)
+
+    def search_planit(self, council, start_date, end_date, cancel_event):
+        with self.lock:
+            self.network_thread_ids.add(get_ident())
+        return AuthoritySearchResult()
 
 
 class OrchestrationTests(unittest.TestCase):
@@ -85,7 +159,7 @@ class OrchestrationTests(unittest.TestCase):
         self.database.close()
         self.temp_directory.cleanup()
 
-    def test_primary_phase_precedes_serial_planit_and_persists_outcomes_and_events(self) -> None:
+    def test_each_primary_phase_precedes_its_planit_phase_and_persists_outcomes_and_events(self) -> None:
         searcher = FakeAuthoritySearcher(
             primary={
                 "alpha": [make_application("alpha", "A1"), make_application("alpha", "SKIP", "Garden shed"), make_application("alpha", "OUT", longitude=8)],
@@ -103,7 +177,12 @@ class OrchestrationTests(unittest.TestCase):
 
         summary = service.run(self.request, events.append, Event())
 
-        self.assertEqual([("primary", "alpha"), ("primary", "beta"), ("primary", "gamma"), ("planit", "alpha"), ("planit", "beta"), ("planit", "gamma")], searcher.calls)
+        for code in ("alpha", "beta", "gamma"):
+            with self.subTest(code=code):
+                self.assertLess(
+                    searcher.calls.index(("primary", code)),
+                    searcher.calls.index(("planit", code)),
+                )
         self.assertEqual("completed_with_issues", summary.status)
         self.assertEqual((3, 3, 3, 0, 1), (summary.total_councils, summary.searched_councils, summary.saved_applications, summary.empty_councils, summary.failed_councils))
         self.assertEqual(["A1", "A2", "B1"], [row[0] for row in self.database.connection.execute("SELECT reference FROM applications ORDER BY reference")])
@@ -118,6 +197,116 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(2, kinds.count("warning"))
         progress = [event.completed for event in events if event.completed is not None]
         self.assertEqual(sorted(progress), progress)
+
+    def test_searches_at_most_eight_councils_concurrently_and_planit_is_single_flight(self) -> None:
+        councils = [make_council(f"council-{index}") for index in range(10)]
+        searcher = BlockingConcurrentSearcher()
+        service = PlanningSearchService(
+            self.database,
+            AuthorityCatalogue(councils),
+            searcher,
+            clock=lambda: NOW,
+        )
+        result: list[object] = []
+        errors: list[BaseException] = []
+
+        def run_search() -> None:
+            try:
+                result.append(service.run(self.request, lambda event: None, Event()))
+            except BaseException as error:
+                errors.append(error)
+
+        search_thread = Thread(target=run_search)
+        search_thread.start()
+        try:
+            self.assertTrue(searcher.eight_started.wait(2))
+            self.assertEqual(8, searcher.max_active)
+            searcher.release_primary.set()
+            self.assertTrue(searcher.first_planit_started.wait(2))
+            self.assertFalse(searcher.planit_overlap.wait(0.1))
+            searcher.release_planit.set()
+            search_thread.join(2)
+        finally:
+            searcher.release_primary.set()
+            searcher.release_planit.set()
+            search_thread.join(2)
+
+        self.assertFalse(search_thread.is_alive())
+        self.assertEqual([], errors)
+        self.assertEqual(1, len(result))
+        self.assertEqual(1, searcher.max_planit_active)
+        self.assertFalse(searcher.duplicate_council)
+        expected_codes = {council.code for council in councils}
+        self.assertEqual(expected_codes, searcher.primary_calls)
+        self.assertEqual(expected_codes, searcher.planit_calls)
+
+    def test_finished_council_is_saved_immediately_on_the_coordinator_thread(self) -> None:
+        councils = [make_council("alpha"), make_council("beta")]
+        searcher = SplitCompletionSearcher()
+        service = PlanningSearchService(
+            self.database,
+            AuthorityCatalogue(councils),
+            searcher,
+            clock=lambda: NOW,
+        )
+        alpha_finished = Event()
+        coordinator_thread_ids: list[int] = []
+        save_thread_ids: list[int] = []
+        event_thread_ids: list[int] = []
+        errors: list[BaseException] = []
+        original_save = self.database.save_council_result
+
+        def observed_save(*args, **kwargs):
+            save_thread_ids.append(get_ident())
+            return original_save(*args, **kwargs)
+
+        def observed_emit(event) -> None:
+            event_thread_ids.append(get_ident())
+            if event.kind == "council_finished" and event.council == "Alpha Council":
+                alpha_finished.set()
+
+        def run_search() -> None:
+            coordinator_thread_ids.append(get_ident())
+            try:
+                service.run(self.request, observed_emit, Event())
+            except BaseException as error:
+                errors.append(error)
+
+        self.database.save_council_result = observed_save
+        search_thread = Thread(target=run_search)
+        search_thread.start()
+        try:
+            self.assertTrue(alpha_finished.wait(2))
+            self.assertTrue(searcher.beta_entered.is_set())
+            self.assertEqual(
+                [("alpha", "success")],
+                [
+                    tuple(row)
+                    for row in self.database.connection.execute(
+                        "SELECT c.code, o.outcome_status "
+                        "FROM council_search_outcomes o "
+                        "JOIN councils c ON c.id=o.council_id"
+                    )
+                ],
+            )
+            self.assertTrue(search_thread.is_alive())
+            searcher.release_beta.set()
+            search_thread.join(2)
+        finally:
+            self.database.save_council_result = original_save
+            searcher.release_beta.set()
+            search_thread.join(2)
+
+        self.assertFalse(search_thread.is_alive())
+        self.assertEqual([], errors)
+        self.assertEqual(1, len(coordinator_thread_ids))
+        coordinator_thread_id = coordinator_thread_ids[0]
+        self.assertTrue(save_thread_ids)
+        self.assertTrue(event_thread_ids)
+        self.assertTrue(all(identifier == coordinator_thread_id for identifier in save_thread_ids))
+        self.assertTrue(all(identifier == coordinator_thread_id for identifier in event_thread_ids))
+        self.assertTrue(set(save_thread_ids).isdisjoint(searcher.network_thread_ids))
+        self.assertTrue(set(event_thread_ids).isdisjoint(searcher.network_thread_ids))
 
     def test_no_intersection_is_a_successful_zero_council_run(self) -> None:
         far = {"type": "Polygon", "coordinates": [[[10, 10], [11, 10], [11, 11], [10, 11], [10, 10]]]}
@@ -141,7 +330,13 @@ class OrchestrationTests(unittest.TestCase):
             cancel=cancel,
         )
         events = []
-        service = PlanningSearchService(self.database, AuthorityCatalogue(self.councils), searcher, clock=lambda: NOW)
+        service = PlanningSearchService(
+            self.database,
+            AuthorityCatalogue(self.councils),
+            searcher,
+            clock=lambda: NOW,
+            worker_limit=1,
+        )
 
         summary = service.run(self.request, events.append, cancel)
 
@@ -161,7 +356,13 @@ class OrchestrationTests(unittest.TestCase):
             planit={"alpha": [], "gamma": []},
         )
         cancel = Event()
-        service = PlanningSearchService(self.database, AuthorityCatalogue(self.councils), searcher, clock=lambda: NOW)
+        service = PlanningSearchService(
+            self.database,
+            AuthorityCatalogue(self.councils),
+            searcher,
+            clock=lambda: NOW,
+            worker_limit=1,
+        )
         events = []
 
         summary = service.run(self.request, events.append, cancel)

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+import random
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from threading import Event
+from time import monotonic
 from typing import Callable, Iterable, Protocol
 
 from planning_ping.contracts import SearchEvent, SearchRequest, SearchSummary
@@ -15,6 +18,8 @@ from .filtering import application_matches_request, reconcile_applications
 from .geometry import load_geojson, location_match_quality, validate_geojson
 from .models import Council, PlanningApplication
 from .persistence import PlanningDatabase
+from .rate_limits import PLANIT_RATE_LIMIT_SCOPE, primary_rate_limit_scope
+from .scheduler import CouncilPhaseScheduler, CouncilPhaseTask
 
 
 def _utc_now() -> datetime:
@@ -48,13 +53,25 @@ class AuthoritySearcher(Protocol):
 @dataclass(slots=True)
 class _CouncilState:
     council: Council
-    started_at: datetime
+    started_at: datetime | None = None
     primary: AuthoritySearchResult | None = None
+    planit: AuthoritySearchResult | None = None
     primary_error: Exception | None = None
+    planit_error: Exception | None = None
+    rate_limit_attempts: dict[str, int] = field(default_factory=dict)
+    saved: bool = False
+
+
+@dataclass(slots=True)
+class _RunCounters:
+    completed: int = 0
+    saved: int = 0
+    empty: int = 0
+    failed: int = 0
 
 
 class PlanningSearchService:
-    """Runs on a UI worker thread and commits one council at a time."""
+    """Coordinates concurrent council phases and persists on the caller thread."""
 
     def __init__(
         self,
@@ -63,11 +80,17 @@ class PlanningSearchService:
         searcher: AuthoritySearcher,
         *,
         clock: Callable[[], datetime] = _utc_now,
+        worker_limit: int = 8,
+        monotonic_clock: Callable[[], float] = monotonic,
+        jitter: Callable[[float, float], float] = random.uniform,
     ) -> None:
         self._database = database
         self._catalogue = catalogue
         self._searcher = searcher
         self._clock = clock
+        self._worker_limit = min(max(int(worker_limit), 1), 8)
+        self._monotonic_clock = monotonic_clock
+        self._jitter = jitter
 
     def run(
         self,
@@ -89,166 +112,90 @@ class PlanningSearchService:
         )
         emit(SearchEvent(kind="started", run_id=run_id, total=len(councils), message="Search started"))
 
-        states: list[_CouncilState] = []
+        states = {council.code: _CouncilState(council) for council in councils}
+        counters = _RunCounters()
+        scheduler = CouncilPhaseScheduler()
         for council in councils:
-            if cancel_event.is_set():
-                break
-            council_started_at = self._clock()
-            emit(
-                SearchEvent(
-                    kind="council_started",
-                    run_id=run_id,
-                    council=council.name,
-                    completed=0,
-                    total=len(councils),
+            scheduler.enqueue(
+                CouncilPhaseTask(
+                    council_code=council.code,
+                    phase="primary",
+                    scope=primary_rate_limit_scope(council),
                 )
             )
-            state = _CouncilState(council, council_started_at)
-            try:
-                state.primary = self._searcher.search_primary(
-                    council, request.start_date, request.end_date, cancel_event
-                )
-            except Exception as exc:
-                state.primary_error = exc
-            states.append(state)
+
+        if councils:
+            worker_count = min(self._worker_limit, len(councils))
+            in_flight: dict[Future[AuthoritySearchResult], CouncilPhaseTask] = {}
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="planning-council",
+            ) as executor:
+                while (scheduler.has_pending() and not cancel_event.is_set()) or in_flight:
+                    self._submit_ready_phases(
+                        executor,
+                        scheduler,
+                        in_flight,
+                        states,
+                        request,
+                        emit,
+                        run_id,
+                        counters.completed,
+                        len(councils),
+                        cancel_event,
+                    )
+                    if not in_flight and cancel_event.is_set():
+                        break
+                    completed_futures = self._wait_for_progress(
+                        tuple(in_flight), scheduler, cancel_event
+                    )
+                    for future in completed_futures:
+                        task = in_flight.pop(future)
+                        scheduler.release(task)
+                        self._handle_phase_result(
+                            task,
+                            future,
+                            scheduler,
+                            states,
+                            request,
+                            uploaded_geometries,
+                            emit,
+                            run_id,
+                            counters,
+                            cancel_event,
+                        )
 
         if cancel_event.is_set():
             return self._finish_cancelled(
                 run_id,
                 started_at,
                 councils,
-                states,
+                states.values(),
                 uploaded_geometries,
                 request,
                 emit,
+                counters,
             )
 
-        saved_count = 0
-        empty_count = 0
-        failed_count = 0
-        completed = 0
-        for state in states:
-            if cancel_event.is_set():
-                remaining = states[completed:]
-                return self._finish_cancelled(
-                    run_id,
-                    started_at,
-                    councils,
-                    remaining,
-                    uploaded_geometries,
-                    request,
-                    emit,
-                    already_completed=completed,
-                    already_saved=saved_count,
-                    already_empty=empty_count,
-                    already_failed=failed_count,
-                )
-
-            planit: AuthoritySearchResult | None = None
-            planit_error: Exception | None = None
-            try:
-                planit = self._searcher.search_planit(
-                    state.council, request.start_date, request.end_date, cancel_event
-                )
-            except Exception as exc:
-                planit_error = exc
-
-            if cancel_event.is_set():
-                return self._finish_cancelled(
-                    run_id,
-                    started_at,
-                    councils,
-                    states[completed:],
-                    uploaded_geometries,
-                    request,
-                    emit,
-                    already_completed=completed,
-                    already_saved=saved_count,
-                    already_empty=empty_count,
-                    already_failed=failed_count,
-                )
-
-            primary_items = state.primary.applications if state.primary else ()
-            planit_items = planit.applications if planit else ()
-            merged = reconcile_applications(primary_items, planit_items)
-            matched = self._matching_applications(merged, uploaded_geometries, request)
-            problem = self._problem_for_sources(state, planit, planit_error)
-            if state.primary_error is not None and planit_error is not None:
-                outcome = "error"
-                failed_count += 1
-            elif problem is not None:
-                outcome = "warning"
-            elif matched:
-                outcome = "success"
-            else:
-                outcome = "empty"
-                empty_count += 1
-
-            ids = self._database.save_council_result(
-                run_id,
-                state.council,
-                matched,
-                outcome=outcome,
-                exception=problem,
-                started_at=state.started_at,
-                finished_at=self._clock(),
-            )
-            for application, _application_id in zip(matched, ids):
-                saved_count += 1
-                emit(
-                    SearchEvent(
-                        kind="application_saved",
-                        run_id=run_id,
-                        council=state.council.name,
-                        completed=completed,
-                        total=len(councils),
-                        saved_count=saved_count,
-                        message=application.reference,
-                    )
-                )
-            if problem is not None:
-                emit(
-                    SearchEvent(
-                        kind="warning",
-                        run_id=run_id,
-                        council=state.council.name,
-                        completed=completed,
-                        total=len(councils),
-                        saved_count=saved_count,
-                        message=str(problem),
-                    )
-                )
-            completed += 1
-            emit(
-                SearchEvent(
-                    kind="council_finished",
-                    run_id=run_id,
-                    council=state.council.name,
-                    completed=completed,
-                    total=len(councils),
-                    saved_count=saved_count,
-                )
-            )
-
-        status = "completed_with_issues" if failed_count or self._run_has_warnings(run_id) else "completed"
+        status = "completed_with_issues" if counters.failed or self._run_has_warnings(run_id) else "completed"
         finished_at = self._clock()
         self._database.finish_search(
             run_id,
             status=status,
-            searched_councils=completed,
-            saved_applications=saved_count,
-            empty_councils=empty_count,
-            failed_councils=failed_count,
+            searched_councils=counters.completed,
+            saved_applications=counters.saved,
+            empty_councils=counters.empty,
+            failed_councils=counters.failed,
             finished_at=finished_at,
         )
         summary = SearchSummary(
             run_id=run_id,
             status=status,
             total_councils=len(councils),
-            searched_councils=completed,
-            saved_applications=saved_count,
-            empty_councils=empty_count,
-            failed_councils=failed_count,
+            searched_councils=counters.completed,
+            saved_applications=counters.saved,
+            empty_councils=counters.empty,
+            failed_councils=counters.failed,
             started_at=started_at,
             finished_at=finished_at,
         )
@@ -256,13 +203,212 @@ class PlanningSearchService:
             SearchEvent(
                 kind="completed",
                 run_id=run_id,
-                completed=completed,
+                completed=counters.completed,
                 total=len(councils),
-                saved_count=saved_count,
+                saved_count=counters.saved,
                 message="Search completed",
             )
         )
         return summary
+
+    def _run_phase(
+        self,
+        task: CouncilPhaseTask,
+        state: _CouncilState,
+        request: SearchRequest,
+        cancel_event: Event,
+    ) -> AuthoritySearchResult:
+        if task.phase == "primary":
+            return self._searcher.search_primary(
+                state.council,
+                request.start_date,
+                request.end_date,
+                cancel_event,
+            )
+        return self._searcher.search_planit(
+            state.council,
+            request.start_date,
+            request.end_date,
+            cancel_event,
+        )
+
+    def _submit_ready_phases(
+        self,
+        executor: ThreadPoolExecutor,
+        scheduler: CouncilPhaseScheduler,
+        in_flight: dict[Future[AuthoritySearchResult], CouncilPhaseTask],
+        states: dict[str, _CouncilState],
+        request: SearchRequest,
+        emit: Callable[[SearchEvent], None],
+        run_id: int,
+        completed: int,
+        total: int,
+        cancel_event: Event,
+    ) -> None:
+        while len(in_flight) < self._worker_limit and not cancel_event.is_set():
+            task = scheduler.acquire(now=self._monotonic_clock())
+            if task is None:
+                return
+            if cancel_event.is_set():
+                scheduler.release(task)
+                return
+            state = states[task.council_code]
+            if task.phase == "primary" and state.started_at is None:
+                state.started_at = self._clock()
+                emit(
+                    SearchEvent(
+                        kind="council_started",
+                        run_id=run_id,
+                        council=state.council.name,
+                        completed=completed,
+                        total=total,
+                    )
+                )
+            future = executor.submit(self._run_phase, task, state, request, cancel_event)
+            in_flight[future] = task
+
+    def _wait_for_progress(
+        self,
+        futures: tuple[Future[AuthoritySearchResult], ...],
+        scheduler: CouncilPhaseScheduler,
+        cancel_event: Event,
+    ) -> set[Future[AuthoritySearchResult]]:
+        now = self._monotonic_clock()
+        next_ready_at = scheduler.next_ready_at(now=now)
+        timeout = None if next_ready_at is None else max(next_ready_at - now, 0.0)
+        if futures:
+            completed, _pending = wait(
+                futures,
+                timeout=timeout,
+                return_when=FIRST_COMPLETED,
+            )
+            return completed
+        if timeout is not None:
+            cancel_event.wait(timeout)
+        return set()
+
+    def _handle_phase_result(
+        self,
+        task: CouncilPhaseTask,
+        future: Future[AuthoritySearchResult],
+        scheduler: CouncilPhaseScheduler,
+        states: dict[str, _CouncilState],
+        request: SearchRequest,
+        uploaded_geometries: list[dict[str, object]],
+        emit: Callable[[SearchEvent], None],
+        run_id: int,
+        counters: _RunCounters,
+        cancel_event: Event,
+    ) -> None:
+        state = states[task.council_code]
+        try:
+            result = future.result()
+        except Exception as error:
+            if task.phase == "primary":
+                state.primary_error = error
+            else:
+                state.planit_error = error
+        else:
+            if task.phase == "primary":
+                state.primary = result
+            else:
+                state.planit = result
+
+        if cancel_event.is_set():
+            return
+        if task.phase == "primary":
+            scheduler.enqueue(
+                CouncilPhaseTask(
+                    council_code=task.council_code,
+                    phase="planit",
+                    scope=PLANIT_RATE_LIMIT_SCOPE,
+                )
+            )
+            return
+        self._finalize_council(
+            state,
+            request,
+            uploaded_geometries,
+            emit,
+            run_id,
+            counters,
+            len(states),
+        )
+
+    def _finalize_council(
+        self,
+        state: _CouncilState,
+        request: SearchRequest,
+        uploaded_geometries: list[dict[str, object]],
+        emit: Callable[[SearchEvent], None],
+        run_id: int,
+        counters: _RunCounters,
+        total: int,
+    ) -> None:
+        if state.saved:
+            return
+        primary_items = state.primary.applications if state.primary else ()
+        planit_items = state.planit.applications if state.planit else ()
+        merged = reconcile_applications(primary_items, planit_items)
+        matched = self._matching_applications(merged, uploaded_geometries, request)
+        problem = self._problem_for_sources(state)
+        if state.primary_error is not None and state.planit_error is not None:
+            outcome = "error"
+            counters.failed += 1
+        elif problem is not None:
+            outcome = "warning"
+        elif matched:
+            outcome = "success"
+        else:
+            outcome = "empty"
+            counters.empty += 1
+
+        ids = self._database.save_council_result(
+            run_id,
+            state.council,
+            matched,
+            outcome=outcome,
+            exception=problem,
+            started_at=state.started_at,
+            finished_at=self._clock(),
+        )
+        state.saved = True
+        for application, _application_id in zip(matched, ids):
+            counters.saved += 1
+            emit(
+                SearchEvent(
+                    kind="application_saved",
+                    run_id=run_id,
+                    council=state.council.name,
+                    completed=counters.completed,
+                    total=total,
+                    saved_count=counters.saved,
+                    message=application.reference,
+                )
+            )
+        if problem is not None:
+            emit(
+                SearchEvent(
+                    kind="warning",
+                    run_id=run_id,
+                    council=state.council.name,
+                    completed=counters.completed,
+                    total=total,
+                    saved_count=counters.saved,
+                    message=str(problem),
+                )
+            )
+        counters.completed += 1
+        emit(
+            SearchEvent(
+                kind="council_finished",
+                run_id=run_id,
+                council=state.council.name,
+                completed=counters.completed,
+                total=total,
+                saved_count=counters.saved,
+            )
+        )
 
     def _finish_cancelled(
         self,
@@ -273,20 +419,16 @@ class PlanningSearchService:
         uploaded_geometries: list[dict[str, object]],
         request: SearchRequest,
         emit: Callable[[SearchEvent], None],
-        *,
-        already_completed: int = 0,
-        already_saved: int = 0,
-        already_empty: int = 0,
-        already_failed: int = 0,
+        counters: _RunCounters,
     ) -> SearchSummary:
-        completed = already_completed
-        saved_count = already_saved
-        empty_count = already_empty
-        failed_count = already_failed
         for state in states:
+            if state.saved or state.started_at is None:
+                continue
             primary_items = state.primary.applications if state.primary else ()
-            matched = self._matching_applications(primary_items, uploaded_geometries, request)
-            problem = state.primary_error
+            planit_items = state.planit.applications if state.planit else ()
+            merged = reconcile_applications(primary_items, planit_items)
+            matched = self._matching_applications(merged, uploaded_geometries, request)
+            problem = self._problem_for_sources(state)
             ids = self._database.save_council_result(
                 run_id,
                 state.council,
@@ -296,16 +438,17 @@ class PlanningSearchService:
                 started_at=state.started_at,
                 finished_at=self._clock(),
             )
+            state.saved = True
             for application, _application_id in zip(matched, ids):
-                saved_count += 1
+                counters.saved += 1
                 emit(
                     SearchEvent(
                         kind="application_saved",
                         run_id=run_id,
                         council=state.council.name,
-                        completed=completed,
+                        completed=counters.completed,
                         total=len(councils),
-                        saved_count=saved_count,
+                        saved_count=counters.saved,
                         message=application.reference,
                     )
                 )
@@ -313,20 +456,20 @@ class PlanningSearchService:
         self._database.finish_search(
             run_id,
             status="cancelled",
-            searched_councils=completed,
-            saved_applications=saved_count,
-            empty_councils=empty_count,
-            failed_councils=failed_count,
+            searched_councils=counters.completed,
+            saved_applications=counters.saved,
+            empty_councils=counters.empty,
+            failed_councils=counters.failed,
             finished_at=finished_at,
         )
         summary = SearchSummary(
             run_id=run_id,
             status="cancelled",
             total_councils=len(councils),
-            searched_councils=completed,
-            saved_applications=saved_count,
-            empty_councils=empty_count,
-            failed_councils=failed_count,
+            searched_councils=counters.completed,
+            saved_applications=counters.saved,
+            empty_councils=counters.empty,
+            failed_councils=counters.failed,
             started_at=started_at,
             finished_at=finished_at,
         )
@@ -334,9 +477,9 @@ class PlanningSearchService:
             SearchEvent(
                 kind="cancelled",
                 run_id=run_id,
-                completed=completed,
+                completed=counters.completed,
                 total=len(councils),
-                saved_count=saved_count,
+                saved_count=counters.saved,
                 message="Search cancelled",
             )
         )
@@ -345,18 +488,16 @@ class PlanningSearchService:
     @staticmethod
     def _problem_for_sources(
         state: _CouncilState,
-        planit: AuthoritySearchResult | None,
-        planit_error: Exception | None,
     ) -> Exception | None:
         messages: list[str] = []
         if state.primary_error:
             messages.append(f"Primary search failed: {state.primary_error}")
         if state.primary:
             messages.extend(state.primary.warnings)
-        if planit_error:
-            messages.append(f"PlanIt reconciliation failed: {planit_error}")
-        if planit:
-            messages.extend(planit.warnings)
+        if state.planit_error:
+            messages.append(f"PlanIt reconciliation failed: {state.planit_error}")
+        if state.planit:
+            messages.extend(state.planit.warnings)
         return RuntimeError("; ".join(messages)) if messages else None
 
     @staticmethod
