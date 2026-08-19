@@ -43,6 +43,35 @@ class CouncilFetchError(RuntimeError):
     """Raised when a council page cannot be fetched."""
 
 
+class CouncilRateLimitError(CouncilFetchError):
+    def __init__(
+        self,
+        *,
+        url: str,
+        scope: str,
+        retry_after_seconds: float | None,
+        retry_limit: int,
+    ) -> None:
+        self.url = url
+        self.scope = scope
+        self.retry_after_seconds = retry_after_seconds
+        self.retry_limit = max(int(retry_limit), 0)
+        instruction = (
+            f"; retry after {retry_after_seconds:g} seconds"
+            if retry_after_seconds is not None
+            else ""
+        )
+        super().__init__(f"HTTP 429 while fetching {url}{instruction}")
+
+
+class CouncilAccessBlockedError(CouncilFetchError):
+    def __init__(self, *, url: str, category: str, reason: str) -> None:
+        self.url = url
+        self.category = category
+        self.reason = reason
+        super().__init__(f"HTTP 403 while fetching {url}: {reason}")
+
+
 @dataclass(slots=True)
 class FetchResponse:
     url: str
@@ -329,7 +358,25 @@ class CouncilHttpClient:
                 return response
             except HTTPError as exc:
                 failure_url = str(getattr(exc, "url", None) or url)
-                if exc.code in {429, 503} and attempt < self.retries:
+                if exc.code == 429:
+                    raise CouncilRateLimitError(
+                        url=failure_url,
+                        scope=self._throttle_key(failure_url),
+                        retry_after_seconds=_retry_after_seconds(exc),
+                        retry_limit=self.retries,
+                    ) from exc
+                if exc.code == 403:
+                    charset = "utf-8"
+                    if exc.headers is not None:
+                        charset = exc.headers.get_content_charset() or charset
+                    body = exc.read(12_000).decode(charset, errors="replace")
+                    category, reason = _access_block_classification(body, "")
+                    raise CouncilAccessBlockedError(
+                        url=failure_url,
+                        category=category,
+                        reason=reason,
+                    ) from exc
+                if exc.code == 503 and attempt < self.retries:
                     last_error = exc
                     self._pause_before_retry(failure_url, attempt, exc=exc)
                     continue
@@ -727,6 +774,8 @@ class CouncilBrowserClient:
 
 
 def browser_fallback_recommended(exc: Exception) -> bool:
+    if isinstance(exc, CouncilAccessBlockedError):
+        return False
     text = str(exc).casefold()
     return any(
         token in text
@@ -780,19 +829,27 @@ def _redirected_request(request: Request, target_url: str, status_code: int) -> 
 
 
 def _retry_delay_seconds(exc: HTTPError, attempt: int) -> float:
-    retry_after = exc.headers.get("Retry-After") if exc.headers else None
-    if retry_after:
-        try:
-            return min(max(float(retry_after), 0.0), 20.0)
-        except ValueError:
-            try:
-                retry_time = parsedate_to_datetime(retry_after)
-                if retry_time.tzinfo is None:
-                    retry_time = retry_time.replace(tzinfo=timezone.utc)
-                return min(max((retry_time - datetime.now(timezone.utc)).total_seconds(), 0.0), 20.0)
-            except (TypeError, ValueError, OverflowError):
-                pass
+    retry_after = _retry_after_seconds(exc)
+    if retry_after is not None:
+        return retry_after
     return min(2.0 * (attempt + 1), 10.0)
+
+
+def _retry_after_seconds(exc: HTTPError, *, now: datetime | None = None) -> float | None:
+    retry_after = exc.headers.get("Retry-After") if exc.headers else None
+    if retry_after is None:
+        return None
+    try:
+        return max(float(retry_after), 0.0)
+    except (TypeError, ValueError, OverflowError):
+        try:
+            retry_time = parsedate_to_datetime(str(retry_after))
+            if retry_time.tzinfo is None:
+                retry_time = retry_time.replace(tzinfo=timezone.utc)
+            reference = now or datetime.now(timezone.utc)
+            return max((retry_time - reference).total_seconds(), 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 def _is_tls_certificate_error(exc: Exception) -> bool:
@@ -808,22 +865,9 @@ def _is_tls_certificate_error(exc: Exception) -> bool:
 def _blocked_page_reason(text: str, title: str) -> str | None:
     opening = text[:12000].casefold()
     normalized_title = title.casefold()
-    if any(
-        token in opening or token in normalized_title
-        for token in (
-            "_incapsula_resource",
-            "incapsula incident id",
-            "captcha-sdk.awswaf.com",
-            "awswaf",
-            "checking you're not a bot",
-            "cf-chl-",
-            "cloudflare ray id",
-            "azure waf",
-        )
-    ):
-        return "Web application firewall challenge detected"
-    if "captcha" in opening or "captcha" in normalized_title:
-        return "CAPTCHA challenge detected"
+    category, reason = _access_block_classification(text, title)
+    if category in {"network_filter", "portal_security"}:
+        return reason
     if any(token in normalized_title for token in ("403 forbidden", "access denied", "unauthorized", "sign in")):
         return "Authentication or access-control page detected"
     if len(text) < 12000 and any(
@@ -839,6 +883,27 @@ def _blocked_page_reason(text: str, title: str) -> str | None:
     ):
         return "Council website error page detected"
     return None
+
+
+def _access_block_classification(text: str, title: str) -> tuple[str, str]:
+    opening = text[:12000].casefold()
+    normalized_title = title.casefold()
+    if "content filtering has stopped access" in opening or "streamline3" in opening:
+        return "network_filter", "Local network content filter blocked this council portal"
+    waf_tokens = (
+        "_incapsula_resource",
+        "incapsula incident id",
+        "captcha-sdk.awswaf.com",
+        "awswaf",
+        "cf-chl-",
+        "cloudflare ray id",
+        "azure waf",
+    )
+    if any(token in opening or token in normalized_title for token in waf_tokens):
+        return "portal_security", "Web application firewall challenge detected"
+    if "captcha" in opening or "captcha" in normalized_title:
+        return "portal_security", "CAPTCHA challenge detected"
+    return "access_denied", "The remote service denied access"
 
 
 def _disclaimer_accept_url(response: FetchResponse) -> str | None:

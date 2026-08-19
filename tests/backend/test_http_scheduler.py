@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import io
 import sys
 import ssl
 import threading
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 from urllib.error import HTTPError, URLError
@@ -14,8 +16,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 import planning_ping.backend.http as planning_http
 from planning_ping.backend.http import (
     CouncilBrowserClient,
+    CouncilAccessBlockedError,
     CouncilFetchError,
     CouncilHttpClient,
+    CouncilRateLimitError,
     browser_fallback_recommended,
     monitor_council_requests,
 )
@@ -30,6 +34,14 @@ class FakeHeaders:
 
     def get(self, name: str, default: object = None) -> object:
         return default
+
+
+class MappingHeaders(FakeHeaders):
+    def __init__(self, values: dict[str, str]) -> None:
+        self.values = values
+
+    def get(self, name: str, default: object = None) -> object:
+        return self.values.get(name, default)
 
 
 class FakeResponse:
@@ -53,6 +65,117 @@ class FakeResponse:
 
 
 class HttpBoundaryTests(unittest.TestCase):
+    def test_429_returns_retry_metadata_without_retrying_inside_http_client(self) -> None:
+        class RateLimitedOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, request: object, timeout: float) -> FakeResponse:
+                self.calls += 1
+                raise HTTPError(
+                    "https://www.planit.org.uk/api/applics/json",
+                    429,
+                    "Too Many Requests",
+                    MappingHeaders({"Retry-After": "294"}),
+                    io.BytesIO(b"rate limited"),
+                )
+
+        class Client(CouncilHttpClient):
+            def __init__(self) -> None:
+                super().__init__(min_delay_seconds=0, retries=2, rate_limit_key="planit")
+                self.opener = RateLimitedOpener()
+
+            def _opener(self) -> RateLimitedOpener:
+                return self.opener
+
+        client = Client()
+        with self.assertRaises(CouncilRateLimitError) as raised:
+            client.get("https://www.planit.org.uk/api/applics/json")
+
+        self.assertEqual(1, client.opener.calls)
+        self.assertEqual("planit", raised.exception.scope)
+        self.assertEqual(294.0, raised.exception.retry_after_seconds)
+        self.assertEqual(2, raised.exception.retry_limit)
+
+    def test_retry_after_http_date_is_not_truncated_to_twenty_seconds(self) -> None:
+        now = datetime(2026, 8, 19, 10, 0, tzinfo=timezone.utc)
+        error = HTTPError(
+            "https://planning.test",
+            429,
+            "Too Many Requests",
+            MappingHeaders({"Retry-After": "Wed, 19 Aug 2026 10:05:00 GMT"}),
+            io.BytesIO(),
+        )
+
+        self.assertEqual(300.0, planning_http._retry_after_seconds(error, now=now))
+
+    def test_403_classifies_local_content_filter_and_never_retries(self) -> None:
+        body = (
+            b"<title>Content filtering has stopped access to this web page</title>"
+            b"<p>Streamline3 support reference BR16</p>"
+        )
+
+        class BlockedOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, request: object, timeout: float) -> FakeResponse:
+                self.calls += 1
+                raise HTTPError(
+                    "https://ashford.test/search",
+                    403,
+                    "Forbidden",
+                    MappingHeaders({}),
+                    io.BytesIO(body),
+                )
+
+        class Client(CouncilHttpClient):
+            def __init__(self) -> None:
+                super().__init__(min_delay_seconds=0, retries=6)
+                self.opener = BlockedOpener()
+
+            def _opener(self) -> BlockedOpener:
+                return self.opener
+
+        client = Client()
+        with self.assertRaises(CouncilAccessBlockedError) as raised:
+            client.get("https://ashford.test/search")
+
+        self.assertEqual(1, client.opener.calls)
+        self.assertEqual("network_filter", raised.exception.category)
+        self.assertIn("local network content filter", str(raised.exception).casefold())
+
+    def test_403_empty_body_is_access_denied_without_retrying(self) -> None:
+        class BlockedOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, request: object, timeout: float) -> FakeResponse:
+                self.calls += 1
+                raise HTTPError(
+                    "https://planning.test/search",
+                    403,
+                    "Forbidden",
+                    MappingHeaders({}),
+                    io.BytesIO(),
+                )
+
+        class Client(CouncilHttpClient):
+            def __init__(self) -> None:
+                super().__init__(min_delay_seconds=0, retries=6)
+                self.opener = BlockedOpener()
+
+            def _opener(self) -> BlockedOpener:
+                return self.opener
+
+        client = Client()
+        with self.assertRaises(CouncilAccessBlockedError) as raised:
+            client.get("https://planning.test/search")
+
+        self.assertEqual(1, client.opener.calls)
+        self.assertEqual("access_denied", raised.exception.category)
+        self.assertIn("HTTP 403", str(raised.exception))
+
     def test_ssl_context_uses_system_trust_unless_an_explicit_ca_file_is_supplied(self) -> None:
         system_context = object()
         explicit_context = object()
@@ -471,6 +594,15 @@ class HttpBoundaryTests(unittest.TestCase):
                 browser._wait_for_usable_page()
 
     def test_browser_fallback_is_never_recommended_for_access_controls(self) -> None:
+        self.assertFalse(
+            browser_fallback_recommended(
+                CouncilAccessBlockedError(
+                    url="https://planning.test",
+                    category="access_denied",
+                    reason="The remote service denied access",
+                )
+            )
+        )
         for message in (
             "Blocked by web application firewall",
             "CAPTCHA challenge detected",
