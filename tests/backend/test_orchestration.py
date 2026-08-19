@@ -741,16 +741,110 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual("cancelled", results[0].status)
         self.assertEqual(1, searcher.planit_calls)
 
+    def test_cancellation_at_worker_entry_prevents_source_invocation(self) -> None:
+        class RecordingSearcher:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def search_primary(self, council, start_date, end_date, cancel_event):
+                self.calls.append(("primary", council.code))
+                return AuthoritySearchResult()
+
+            def search_planit(self, council, start_date, end_date, cancel_event):
+                self.calls.append(("planit", council.code))
+                return AuthoritySearchResult()
+
+        cancel_event = Event()
+        searcher = RecordingSearcher()
+        service = PlanningSearchService(
+            self.database,
+            AuthorityCatalogue([self.councils[0]]),
+            searcher,
+            clock=lambda: NOW,
+            worker_limit=1,
+        )
+        boundary_entered = Event()
+        release_boundary = Event()
+        coordinator_thread_ids: list[int] = []
+        event_thread_ids: list[int] = []
+        save_thread_ids: list[int] = []
+        summaries = []
+        errors: list[BaseException] = []
+        events = []
+        original_save = self.database.save_council_result
+
+        def recording_save(*args, **kwargs):
+            save_thread_ids.append(get_ident())
+            return original_save(*args, **kwargs)
+
+        def observed_emit(event) -> None:
+            event_thread_ids.append(get_ident())
+            events.append(event)
+            if event.kind == "council_started":
+                boundary_entered.set()
+                release_boundary.wait()
+
+        def run_search() -> None:
+            coordinator_thread_ids.append(get_ident())
+            try:
+                summaries.append(service.run(self.request, observed_emit, cancel_event))
+            except BaseException as error:
+                errors.append(error)
+
+        self.database.save_council_result = recording_save
+        search_thread = Thread(target=run_search)
+        search_thread.start()
+        try:
+            self.assertTrue(boundary_entered.wait(2))
+            cancel_event.set()
+            release_boundary.set()
+            search_thread.join(2)
+        finally:
+            cancel_event.set()
+            release_boundary.set()
+            search_thread.join(2)
+            self.database.save_council_result = original_save
+
+        self.assertFalse(search_thread.is_alive())
+        self.assertEqual([], errors)
+        self.assertEqual(1, len(summaries))
+        summary = summaries[0]
+        self.assertEqual("cancelled", summary.status)
+        self.assertEqual([], searcher.calls)
+        self.assertEqual(1, len(coordinator_thread_ids))
+        coordinator_thread = coordinator_thread_ids[0]
+        self.assertEqual([coordinator_thread], save_thread_ids)
+        self.assertTrue(
+            all(thread_id == coordinator_thread for thread_id in event_thread_ids)
+        )
+        self.assertEqual(
+            ["started", "council_started", "cancelled"],
+            [event.kind for event in events],
+        )
+        outcome = self.database.connection.execute(
+            "SELECT o.outcome_status FROM council_search_outcomes o "
+            "JOIN councils c ON c.id=o.council_id WHERE c.code='alpha'"
+        ).fetchone()
+        self.assertEqual("cancelled", outcome[0])
+        terminal = self.database.connection.execute(
+            "SELECT status, finished_at FROM search_runs"
+        ).fetchone()
+        self.assertEqual("cancelled", terminal[0])
+        self.assertIsNotNone(terminal[1])
+
     def test_cancellation_drains_active_work_once_and_leaves_deferred_retry_unsaved(self) -> None:
         class ActiveAndDeferredSearcher:
             def __init__(self) -> None:
                 self.primary_calls: list[str] = []
                 self.planit_calls: list[str] = []
+                self.beta_entered = Event()
+                self.release_beta = Event()
 
             def search_primary(self, council, start_date, end_date, cancel_event):
                 self.primary_calls.append(council.code)
                 if council.code == "beta":
-                    cancel_event.wait(2)
+                    self.beta_entered.set()
+                    self.release_beta.wait()
                     return AuthoritySearchResult((make_application("beta", "B1"),))
                 if council.code == "gamma":
                     raise CouncilRateLimitError(
@@ -779,6 +873,8 @@ class OrchestrationTests(unittest.TestCase):
         alpha_finished = False
         gamma_deferred = False
         saved_codes: list[str] = []
+        summaries = []
+        errors: list[BaseException] = []
         original_save = self.database.save_council_result
 
         def recording_save(run_id, council, applications, **kwargs):
@@ -800,17 +896,35 @@ class OrchestrationTests(unittest.TestCase):
             if alpha_finished and gamma_deferred:
                 cancel_event.set()
 
-        self.database.save_council_result = recording_save
-        try:
-            summary = service.run(self.request, observed_emit, cancel_event)
-        finally:
-            self.database.save_council_result = original_save
-            cancel_event.set()
+        def run_search() -> None:
+            try:
+                summaries.append(service.run(self.request, observed_emit, cancel_event))
+            except BaseException as error:
+                errors.append(error)
 
+        self.database.save_council_result = recording_save
+        search_thread = Thread(target=run_search)
+        search_thread.start()
+        try:
+            self.assertTrue(searcher.beta_entered.wait(2))
+            self.assertTrue(cancel_event.wait(2))
+            searcher.release_beta.set()
+            search_thread.join(2)
+        finally:
+            cancel_event.set()
+            searcher.release_beta.set()
+            search_thread.join(2)
+            self.database.save_council_result = original_save
+
+        self.assertFalse(search_thread.is_alive())
+        self.assertEqual([], errors)
+        self.assertEqual(1, len(summaries))
+        summary = summaries[0]
         self.assertEqual("cancelled", summary.status)
         self.assertEqual(1, saved_codes.count("alpha"))
-        self.assertLessEqual(saved_codes.count("beta"), 1)
+        self.assertEqual(1, saved_codes.count("beta"))
         self.assertNotIn("gamma", saved_codes)
+        self.assertEqual(2, summary.saved_applications)
         self.assertEqual(
             "success",
             self.database.connection.execute(
@@ -825,6 +939,32 @@ class OrchestrationTests(unittest.TestCase):
                 for event in events
             ),
         )
+        beta_result = self.database.connection.execute(
+            "SELECT o.outcome_status, a.reference "
+            "FROM council_search_outcomes o "
+            "JOIN councils c ON c.id=o.council_id "
+            "JOIN search_run_applications sra ON sra.run_id=o.run_id "
+            "JOIN applications a ON a.id=sra.application_id AND a.council_id=c.id "
+            "WHERE c.code='beta'"
+        ).fetchall()
+        self.assertEqual([("cancelled", "B1")], [tuple(row) for row in beta_result])
+        self.assertEqual(
+            1,
+            sum(
+                event.kind == "application_saved"
+                and event.council == "Beta Council"
+                and event.message == "B1"
+                for event in events
+            ),
+        )
+        self.assertEqual(
+            0,
+            sum(
+                event.kind == "council_finished" and event.council == "Beta Council"
+                for event in events
+            ),
+        )
+        self.assertEqual(1, searcher.primary_calls.count("beta"))
         self.assertEqual(1, searcher.primary_calls.count("gamma"))
         self.assertNotIn("gamma", searcher.planit_calls)
         terminal = self.database.connection.execute(

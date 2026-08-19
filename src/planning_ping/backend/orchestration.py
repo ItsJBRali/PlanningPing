@@ -225,6 +225,8 @@ class PlanningSearchService:
         request: SearchRequest,
         cancel_event: Event,
     ) -> AuthoritySearchResult:
+        if cancel_event.is_set():
+            return AuthoritySearchResult()
         if task.phase == "primary":
             return self._searcher.search_primary(
                 state.council,
