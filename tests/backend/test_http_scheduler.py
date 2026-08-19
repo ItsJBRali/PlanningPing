@@ -25,7 +25,15 @@ from planning_ping.backend.http import (
 )
 from planning_ping.backend.adapters.arcus import ArcusCouncilConfig, ArcusPlanningScraper
 from planning_ping.backend.adapters.wiltshire import WiltshireCouncilConfig, WiltshirePlanningScraper
-from planning_ping.backend.scheduler import PlatformAwareScheduler, ScheduledTask
+from planning_ping.backend.models import Council
+from planning_ping.backend.rate_limits import fallback_retry_delay, primary_rate_limit_scope
+from planning_ping.backend.scheduler import (
+    PLANIT_RATE_LIMIT_SCOPE,
+    CouncilPhaseScheduler,
+    CouncilPhaseTask,
+    PlatformAwareScheduler,
+    ScheduledTask,
+)
 
 
 class FakeHeaders:
@@ -627,6 +635,64 @@ class HttpBoundaryTests(unittest.TestCase):
 
 
 class SchedulerBoundaryTests(unittest.TestCase):
+    def test_primary_scopes_are_stable_and_fallback_backoff_is_bounded(self) -> None:
+        council = Council(
+            "alpha",
+            "Alpha Council",
+            "England",
+            "idox",
+            "Idox",
+            "https://alpha.test",
+            None,
+            "https://alpha.test/search",
+            {},
+        )
+        custom = Council(
+            "beta",
+            "Beta Council",
+            "England",
+            "custom",
+            "Arcus",
+            "https://beta.test",
+            None,
+            "https://beta.test/search",
+            {},
+        )
+
+        self.assertEqual("portal:idox", primary_rate_limit_scope(council))
+        self.assertEqual("portal:arcus", primary_rate_limit_scope(custom))
+        self.assertEqual(
+            [2.0, 4.0, 8.0, 10.0, 10.0],
+            [fallback_retry_delay(number, lambda low, high: 0.0) for number in range(1, 6)],
+        )
+
+    def test_council_phase_scheduler_defers_without_occupying_an_active_slot(self) -> None:
+        scheduler = CouncilPhaseScheduler()
+        alpha_primary = CouncilPhaseTask("alpha", "primary", "portal:idox")
+        alpha_planit = CouncilPhaseTask("alpha", "planit", PLANIT_RATE_LIMIT_SCOPE)
+        beta_planit = CouncilPhaseTask("beta", "planit", PLANIT_RATE_LIMIT_SCOPE)
+        gamma_primary = CouncilPhaseTask("gamma", "primary", "portal:arcus")
+        for task in (alpha_primary, alpha_planit, beta_planit, gamma_primary):
+            scheduler.enqueue(task)
+
+        self.assertEqual(alpha_primary, scheduler.acquire(now=0.0))
+        self.assertEqual(beta_planit, scheduler.acquire(now=0.0))
+        self.assertEqual(gamma_primary, scheduler.acquire(now=0.0))
+        self.assertIsNone(scheduler.acquire(now=0.0))
+
+        scheduler.release(alpha_primary)
+        scheduler.defer(alpha_primary, ready_at=30.0)
+        scheduler.release(beta_planit)
+        scheduler.set_scope_cooldown(PLANIT_RATE_LIMIT_SCOPE, ready_at=20.0)
+        scheduler.release(gamma_primary)
+
+        self.assertIsNone(scheduler.acquire(now=10.0))
+        self.assertEqual(20.0, scheduler.next_ready_at(now=10.0))
+        self.assertEqual(alpha_planit, scheduler.acquire(now=20.0))
+        scheduler.release(alpha_planit)
+        self.assertIsNone(scheduler.acquire(now=29.0))
+        self.assertEqual(alpha_primary, scheduler.acquire(now=30.0))
+
     def test_allows_one_active_request_per_host_and_adapts_after_rate_limiting(self) -> None:
         scheduler = PlatformAwareScheduler[str](platform_limits={"idox": 2}, default_platform_limit=1, host_limit=1, rate_limit_cooldown_seconds=0)
         scheduler.load_phase(

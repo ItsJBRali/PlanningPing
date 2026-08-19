@@ -3,8 +3,12 @@ from __future__ import annotations
 import threading
 from collections import deque
 from dataclasses import dataclass
+import heapq
+from itertools import count
 from time import monotonic
-from typing import Callable, Generic, Iterable, TypeVar
+from typing import Callable, Generic, Iterable, Literal, TypeVar
+
+from .rate_limits import PLANIT_RATE_LIMIT_SCOPE
 
 
 T = TypeVar("T")
@@ -23,6 +27,85 @@ class SchedulerAdjustment:
     limit: int
     reason: str
     cooldown_seconds: float = 0.0
+
+
+CouncilPhase = Literal["primary", "planit"]
+
+
+@dataclass(frozen=True, slots=True)
+class CouncilPhaseTask:
+    council_code: str
+    phase: CouncilPhase
+    scope: str
+
+
+class CouncilPhaseScheduler:
+    """Non-blocking scheduler for primary and PlanIt council search phases."""
+
+    def __init__(self) -> None:
+        self._ready: deque[CouncilPhaseTask] = deque()
+        self._deferred: list[tuple[float, int, CouncilPhaseTask]] = []
+        self._sequence = count()
+        self._active_councils: set[str] = set()
+        self._planit_active = False
+        self._scope_cooldowns: dict[str, float] = {}
+
+    def enqueue(self, task: CouncilPhaseTask) -> None:
+        self._ready.append(task)
+
+    def defer(self, task: CouncilPhaseTask, *, ready_at: float) -> None:
+        heapq.heappush(self._deferred, (ready_at, next(self._sequence), task))
+
+    def set_scope_cooldown(self, scope: str, *, ready_at: float) -> None:
+        self._scope_cooldowns[scope] = max(self._scope_cooldowns.get(scope, 0.0), ready_at)
+
+    def acquire(self, *, now: float) -> CouncilPhaseTask | None:
+        self._promote_due(now)
+        for _candidate in range(len(self._ready)):
+            task = self._ready.popleft()
+            if self._eligible(task, now):
+                self._activate(task)
+                return task
+            self._ready.append(task)
+        return None
+
+    def release(self, task: CouncilPhaseTask) -> None:
+        self._active_councils.discard(task.council_code)
+        if task.phase == "planit":
+            self._planit_active = False
+
+    def has_pending(self) -> bool:
+        return bool(self._ready or self._deferred)
+
+    def next_ready_at(self, *, now: float) -> float | None:
+        deadlines = [
+            ready_at
+            for ready_at, _sequence, _task in self._deferred
+            if ready_at > now
+        ]
+        deadlines.extend(
+            ready_at
+            for task in self._ready
+            if (ready_at := self._scope_cooldowns.get(task.scope, 0.0)) > now
+        )
+        return min(deadlines, default=None)
+
+    def _promote_due(self, now: float) -> None:
+        while self._deferred and self._deferred[0][0] <= now:
+            _ready_at, _sequence, task = heapq.heappop(self._deferred)
+            self._ready.append(task)
+
+    def _eligible(self, task: CouncilPhaseTask, now: float) -> bool:
+        return (
+            task.council_code not in self._active_councils
+            and self._scope_cooldowns.get(task.scope, 0.0) <= now
+            and (task.phase != "planit" or not self._planit_active)
+        )
+
+    def _activate(self, task: CouncilPhaseTask) -> None:
+        self._active_councils.add(task.council_code)
+        if task.phase == "planit":
+            self._planit_active = True
 
 
 class PlatformAwareScheduler(Generic[T]):
