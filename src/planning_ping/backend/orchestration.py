@@ -335,7 +335,12 @@ class PlanningSearchService:
         except CouncilRateLimitError as error:
             attempt = state.rate_limit_attempts.get(task.phase, 0) + 1
             state.rate_limit_attempts[task.phase] = attempt
-            if attempt > error.retry_limit:
+            retry_limit = (
+                min(error.retry_limit, 2)
+                if task.phase == "planit"
+                else error.retry_limit
+            )
+            if attempt > retry_limit:
                 self._record_phase_error(state, task.phase, error)
                 self._queue_next_or_finalize(
                     task,

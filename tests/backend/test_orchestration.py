@@ -22,8 +22,8 @@ BOUNDARY = {"type": "Polygon", "coordinates": [[[0, 0], [4, 0], [4, 4], [0, 4], 
 NOW = datetime(2026, 1, 31, 9, 0, tzinfo=timezone.utc)
 
 
-def make_council(code: str) -> Council:
-    return Council(code, f"{code.title()} Council", "England", "idox", "Idox", f"https://{code}.test", None, f"https://{code}.test/search", BOUNDARY)
+def make_council(code: str, portal_family: str = "idox") -> Council:
+    return Council(code, f"{code.title()} Council", "England", portal_family, portal_family.title(), f"https://{code}.test", None, f"https://{code}.test/search", BOUNDARY)
 
 
 def make_application(code: str, reference: str, description: str = "Rear extension", *, longitude: float | None = None) -> PlanningApplication:
@@ -148,17 +148,48 @@ class SplitCompletionSearcher:
 
 
 class DeferredPlanItSearcher:
-    def __init__(self) -> None:
+    def __init__(self, monotonic_clock) -> None:
         self.lock = Lock()
+        self.monotonic_clock = monotonic_clock
+        self.blocker_calls = 0
+        self.blocker_rate_limited = Event()
+        self.blocker_primary_started_behind_planit = Event()
+        self.beta_started = Event()
         self.release_beta = Event()
         self.alpha_rate_limited = Event()
         self.gamma_primary_started = Event()
+        self.gamma_planit_started = Event()
+        self.alpha_retry_started = Event()
+        self.gamma_started_before_rate_limit = False
         self.planit_calls: dict[str, int] = {}
 
     def search_primary(self, council, start_date, end_date, cancel_event):
+        if council.code == "blocker":
+            self.blocker_calls += 1
+            if self.blocker_calls == 1:
+                self.blocker_rate_limited.set()
+                raise CouncilRateLimitError(
+                    url="https://blocker.test/search",
+                    scope="portal:idox",
+                    retry_after_seconds=10.0,
+                    retry_limit=2,
+                )
+            if self.blocker_calls == 2:
+                raise CouncilRateLimitError(
+                    url="https://blocker.test/search",
+                    scope="portal:arcus",
+                    retry_after_seconds=0.0,
+                    retry_limit=2,
+                )
+            self.blocker_primary_started_behind_planit.set()
+        if council.code == "alpha":
+            self.beta_started.wait()
         if council.code == "beta":
-            self.release_beta.wait(2)
+            self.beta_started.set()
+            self.release_beta.wait()
         if council.code == "gamma":
+            with self.lock:
+                self.gamma_started_before_rate_limit = not self.alpha_rate_limited.is_set()
             self.gamma_primary_started.set()
         return AuthoritySearchResult()
 
@@ -167,14 +198,58 @@ class DeferredPlanItSearcher:
             calls = self.planit_calls.get(council.code, 0) + 1
             self.planit_calls[council.code] = calls
         if council.code == "alpha" and calls == 1:
+            self.monotonic_clock.advance(10.0)
             self.alpha_rate_limited.set()
             raise CouncilRateLimitError(
                 url="https://www.planit.org.uk/api/applics/json",
                 scope="planit",
-                retry_after_seconds=0.0,
+                retry_after_seconds=60.0,
                 retry_limit=2,
             )
+        if council.code == "alpha":
+            self.alpha_retry_started.set()
+        if council.code == "gamma":
+            self.gamma_planit_started.set()
         return AuthoritySearchResult()
+
+
+class ControlledMonotonicClock:
+    def __init__(self) -> None:
+        self.current = 0.0
+        self.lock = Lock()
+
+    def __call__(self) -> float:
+        with self.lock:
+            return self.current
+
+    def advance(self, seconds: float) -> None:
+        with self.lock:
+            self.current += seconds
+
+
+class AdvancingDeadlineEvent(Event):
+    def __init__(self, clock: ControlledMonotonicClock) -> None:
+        super().__init__()
+        self.clock = clock
+        self.wait_timeouts: list[float | None] = []
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.wait_timeouts.append(timeout)
+        if timeout is not None:
+            self.clock.advance(timeout)
+        return self.is_set()
+
+
+class ObservableDeadlineEvent(Event):
+    def __init__(self) -> None:
+        super().__init__()
+        self.wait_called = Event()
+        self.wait_timeouts: list[float | None] = []
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.wait_timeouts.append(timeout)
+        self.wait_called.set()
+        return super().wait(timeout)
 
 
 class OrchestrationTests(unittest.TestCase):
@@ -340,44 +415,75 @@ class OrchestrationTests(unittest.TestCase):
         self.assertTrue(set(event_thread_ids).isdisjoint(searcher.network_thread_ids))
 
     def test_rate_limited_planit_phase_releases_worker_for_another_council(self) -> None:
-        searcher = DeferredPlanItSearcher()
+        monotonic_clock = ControlledMonotonicClock()
+        searcher = DeferredPlanItSearcher(monotonic_clock)
+        councils = [
+            make_council("blocker", "arcus"),
+            make_council("beta", "arcus"),
+            make_council("alpha", "arcus"),
+            make_council("gamma", "idox"),
+        ]
         service = PlanningSearchService(
             self.database,
-            AuthorityCatalogue(self.councils),
+            AuthorityCatalogue(councils),
             searcher,
             clock=lambda: NOW,
             worker_limit=2,
+            monotonic_clock=monotonic_clock,
         )
+        cancel_event = Event()
         results = []
         errors: list[BaseException] = []
+        finished_before_cleanup = False
 
         def run_search() -> None:
             try:
-                results.append(service.run(self.request, lambda event: None, Event()))
+                results.append(service.run(self.request, lambda event: None, cancel_event))
             except BaseException as error:
                 errors.append(error)
 
         search_thread = Thread(target=run_search)
         search_thread.start()
         try:
+            self.assertTrue(searcher.blocker_rate_limited.wait(2))
             self.assertTrue(searcher.alpha_rate_limited.wait(2))
             self.assertTrue(
                 searcher.gamma_primary_started.wait(2),
                 "the deferred alpha retry kept a worker from processing gamma",
             )
+            self.assertTrue(searcher.blocker_primary_started_behind_planit.wait(2))
+            self.assertFalse(
+                searcher.gamma_started_before_rate_limit,
+                "gamma entered before alpha's PlanIt worker was released by the 429",
+            )
+            self.assertTrue(searcher.beta_started.is_set())
+            self.assertFalse(searcher.release_beta.is_set())
+            self.assertEqual(1, searcher.planit_calls["alpha"])
+            self.assertFalse(
+                searcher.gamma_planit_started.is_set(),
+                "the shared PlanIt cooldown did not hold gamma before the deadline",
+            )
             self.assertTrue(search_thread.is_alive())
+            monotonic_clock.advance(60.0)
             searcher.release_beta.set()
+            self.assertTrue(searcher.alpha_retry_started.wait(2))
             search_thread.join(2)
+            finished_before_cleanup = not search_thread.is_alive()
         finally:
-            searcher.release_beta.set()
-            search_thread.join(2)
+            if search_thread.is_alive():
+                cancel_event.set()
+                monotonic_clock.advance(100.0)
+                searcher.release_beta.set()
+                search_thread.join(2)
 
+        self.assertTrue(finished_before_cleanup)
         self.assertFalse(search_thread.is_alive())
         self.assertEqual([], errors)
         self.assertEqual(1, len(results))
+        self.assertEqual("completed", results[0].status)
         self.assertEqual(2, searcher.planit_calls["alpha"])
 
-    def test_planit_rate_limit_exhaustion_saves_primary_once_with_warning(self) -> None:
+    def test_planit_retry_cap_is_two_even_when_error_advertises_more(self) -> None:
         class ExhaustedPlanItSearcher:
             def __init__(self) -> None:
                 self.planit_calls: dict[str, int] = {}
@@ -391,7 +497,7 @@ class OrchestrationTests(unittest.TestCase):
                     url="https://www.planit.org.uk/api/applics/json",
                     scope="planit",
                     retry_after_seconds=0.0,
-                    retry_limit=2,
+                    retry_limit=6,
                 )
 
         searcher = ExhaustedPlanItSearcher()
@@ -434,6 +540,141 @@ class OrchestrationTests(unittest.TestCase):
             ),
         )
 
+    def test_explicit_retry_after_uses_full_monotonic_deadline_without_fallback(self) -> None:
+        class ExplicitDelaySearcher:
+            def __init__(self) -> None:
+                self.planit_calls = 0
+
+            def search_primary(self, council, start_date, end_date, cancel_event):
+                return AuthoritySearchResult()
+
+            def search_planit(self, council, start_date, end_date, cancel_event):
+                self.planit_calls += 1
+                if self.planit_calls == 1:
+                    raise CouncilRateLimitError(
+                        url="https://www.planit.org.uk/api/applics/json",
+                        scope="planit",
+                        retry_after_seconds=294.0,
+                        retry_limit=2,
+                    )
+                return AuthoritySearchResult()
+
+        clock = ControlledMonotonicClock()
+        cancel_event = AdvancingDeadlineEvent(clock)
+        searcher = ExplicitDelaySearcher()
+        service = PlanningSearchService(
+            self.database,
+            AuthorityCatalogue([self.councils[0]]),
+            searcher,
+            clock=lambda: NOW,
+            monotonic_clock=clock,
+            jitter=lambda low, high: (_ for _ in ()).throw(
+                AssertionError("fallback jitter used for explicit Retry-After")
+            ),
+        )
+
+        summary = service.run(self.request, lambda event: None, cancel_event)
+
+        self.assertEqual("completed", summary.status)
+        self.assertEqual(2, searcher.planit_calls)
+        self.assertEqual([294.0], cancel_event.wait_timeouts)
+
+    def test_missing_retry_after_uses_fallback_deadline_and_injected_jitter(self) -> None:
+        class MissingDelaySearcher:
+            def __init__(self) -> None:
+                self.planit_calls = 0
+
+            def search_primary(self, council, start_date, end_date, cancel_event):
+                return AuthoritySearchResult()
+
+            def search_planit(self, council, start_date, end_date, cancel_event):
+                self.planit_calls += 1
+                if self.planit_calls == 1:
+                    raise CouncilRateLimitError(
+                        url="https://www.planit.org.uk/api/applics/json",
+                        scope="planit",
+                        retry_after_seconds=None,
+                        retry_limit=2,
+                    )
+                return AuthoritySearchResult()
+
+        jitter_calls: list[tuple[float, float]] = []
+
+        def jitter(low: float, high: float) -> float:
+            jitter_calls.append((low, high))
+            return 0.5
+
+        clock = ControlledMonotonicClock()
+        cancel_event = AdvancingDeadlineEvent(clock)
+        searcher = MissingDelaySearcher()
+        service = PlanningSearchService(
+            self.database,
+            AuthorityCatalogue([self.councils[0]]),
+            searcher,
+            clock=lambda: NOW,
+            monotonic_clock=clock,
+            jitter=jitter,
+        )
+
+        summary = service.run(self.request, lambda event: None, cancel_event)
+
+        self.assertEqual("completed", summary.status)
+        self.assertEqual(2, searcher.planit_calls)
+        self.assertEqual([(0.0, 0.5)], jitter_calls)
+        self.assertEqual([2.5], cancel_event.wait_timeouts)
+
+    def test_cancellation_interrupts_deadline_only_wait(self) -> None:
+        class RateLimitedSearcher:
+            def __init__(self) -> None:
+                self.planit_calls = 0
+
+            def search_primary(self, council, start_date, end_date, cancel_event):
+                return AuthoritySearchResult()
+
+            def search_planit(self, council, start_date, end_date, cancel_event):
+                self.planit_calls += 1
+                raise CouncilRateLimitError(
+                    url="https://www.planit.org.uk/api/applics/json",
+                    scope="planit",
+                    retry_after_seconds=294.0,
+                    retry_limit=2,
+                )
+
+        cancel_event = ObservableDeadlineEvent()
+        searcher = RateLimitedSearcher()
+        service = PlanningSearchService(
+            self.database,
+            AuthorityCatalogue([self.councils[0]]),
+            searcher,
+            clock=lambda: NOW,
+            monotonic_clock=lambda: 100.0,
+        )
+        results = []
+        errors: list[BaseException] = []
+
+        def run_search() -> None:
+            try:
+                results.append(service.run(self.request, lambda event: None, cancel_event))
+            except BaseException as error:
+                errors.append(error)
+
+        search_thread = Thread(target=run_search)
+        search_thread.start()
+        try:
+            self.assertTrue(cancel_event.wait_called.wait(2))
+            self.assertEqual([294.0], cancel_event.wait_timeouts)
+            cancel_event.set()
+            search_thread.join(2)
+        finally:
+            cancel_event.set()
+            search_thread.join(2)
+
+        self.assertFalse(search_thread.is_alive())
+        self.assertEqual([], errors)
+        self.assertEqual(1, len(results))
+        self.assertEqual("cancelled", results[0].status)
+        self.assertEqual(1, searcher.planit_calls)
+
     def test_primary_rate_limit_retries_only_primary_and_saves_once(self) -> None:
         class RetriedPrimarySearcher:
             def __init__(self) -> None:
@@ -442,12 +683,12 @@ class OrchestrationTests(unittest.TestCase):
 
             def search_primary(self, council, start_date, end_date, cancel_event):
                 self.primary_calls += 1
-                if self.primary_calls == 1:
+                if self.primary_calls <= 3:
                     raise CouncilRateLimitError(
                         url="https://alpha.test/search",
                         scope="portal:idox",
                         retry_after_seconds=0.0,
-                        retry_limit=6,
+                        retry_limit=3,
                     )
                 return AuthoritySearchResult((make_application("alpha", "A1"),))
 
@@ -465,7 +706,7 @@ class OrchestrationTests(unittest.TestCase):
 
         summary = service.run(self.request, lambda event: None, Event())
 
-        self.assertEqual(2, searcher.primary_calls)
+        self.assertEqual(4, searcher.primary_calls)
         self.assertEqual(1, searcher.planit_calls)
         self.assertEqual(1, summary.saved_applications)
         self.assertEqual(
